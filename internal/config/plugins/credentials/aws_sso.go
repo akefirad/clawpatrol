@@ -146,6 +146,23 @@ func (c *AWSSSOCredential) roleForPlaceholder(akid string) *AWSSSORole {
 	return nil
 }
 
+// NOTE (SSO access-token refresh — DEFERRED, see akefirad/clawpatrol#6):
+// The per-ROLE temporary credentials are refreshed automatically here (the
+// aws.CredentialsCache re-mints them before expiry). The SSO ACCESS TOKEN
+// itself (ssoToken, delivered via the OAuthRegistry) is NOT refreshed: when
+// it expires (IAM Identity Center default ~8h) GetRoleCredentials starts
+// failing and the operator simply re-connects via the dashboard. That is a
+// graceful degradation, not a break.
+//
+// To add refresh later: register an awsSSORefreshSource for Flow=="aws_sso"
+// in the gateway's OAuth setToken switch (mirror anthropicRefreshSource),
+// calling ssooidc CreateToken(grant_type=refresh_token). The open question
+// is WHERE to persist the client secret it needs: the `credentials` table
+// has `client_id` + `refresh_token` but no `client_secret` column. Options
+// (to be decided): pack clientId+clientSecret into the existing client_id
+// column, add a client_secret column (schema migration), or use the blob
+// store. Parked pending that decision.
+
 // roleCreds returns the (cached) temporary credentials for a role, minting
 // them via sso:GetRoleCredentials with the current SSO token on a cache
 // miss / near-expiry. Refresh is expiry-margin + single-flight (both from
