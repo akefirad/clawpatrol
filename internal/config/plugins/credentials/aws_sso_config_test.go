@@ -70,6 +70,43 @@ profile "default" {
 	}
 }
 
+// TestAWSSSOExamplePolicyCompiles loads the shipped examples/aws-sso.hcl
+// (aws_sso_credential + per-service https endpoints + reads-allow /
+// writes-approve / catch-all-deny rules + a human_approver) and asserts it
+// compiles and that the S3 endpoint's write rule is wired to an approver —
+// the HITL path for "S3 writes require human approval".
+func TestAWSSSOExamplePolicyCompiles(t *testing.T) {
+	// examples/ lives at the repo root, four levels up from this package.
+	gw, diags := config.Load("../../../../examples/aws-sso.hcl")
+	if diags.HasErrors() {
+		t.Fatalf("load examples/aws-sso.hcl: %v", diags)
+	}
+	cp, err := config.Compile(gw)
+	if err != nil {
+		t.Fatalf("compile examples/aws-sso.hcl: %v", err)
+	}
+
+	s3, ok := cp.Endpoints["aws-s3"]
+	if !ok {
+		t.Fatal("compiled policy has no aws-s3 endpoint")
+	}
+	approves := false
+	for _, r := range s3.Rules {
+		if len(r.Outcome.Approve) > 0 {
+			approves = true
+			break
+		}
+	}
+	if !approves {
+		t.Error("aws-s3 endpoint has no approve rule — the S3-writes → human_approver HITL path is not wired")
+	}
+
+	prof, ok := cp.Profiles["default"]
+	if !ok || len(prof.Credentials) == 0 {
+		t.Fatal("default profile did not bind the aws_sso credential")
+	}
+}
+
 // TestAWSSSOCredentialConfigRejectsBadRoles asserts the Validate hook
 // surfaces load-time errors for role mappings that would dispatch
 // ambiguously (duplicate placeholder) or fail (empty fields).
