@@ -651,6 +651,10 @@ func (w *webMux) apiOAuthStart(rw http.ResponseWriter, r *http.Request) {
 		w.startOpenAIDeviceFlow(rw, r, id, flow)
 		return
 	}
+	if flow.Flow == "aws_sso" {
+		w.startAWSSSODeviceFlow(rw, r, id, flow)
+		return
+	}
 	if flow.Flow == "notion_mcp" || flow.Flow == "dynamic_mcp" {
 		w.startDynamicMCPFlow(rw, r, id, flow)
 		return
@@ -1369,9 +1373,15 @@ func (w *webMux) apiOAuthDevicePoll(rw http.ResponseWriter, r *http.Request) {
 	// codex deviceauth/token endpoint shape (JSON body, returns
 	// authorization_code + code_verifier instead of a token); the
 	// stdlib RFC-8628 path covers github.
-	if it := w.g.oauth.Integration(sess.id); it != nil && it.Flow == "openai_device" {
-		w.pollOpenAIDeviceFlow(rw, r, sess)
-		return
+	if it := w.g.oauth.Integration(sess.id); it != nil {
+		switch it.Flow {
+		case "openai_device":
+			w.pollOpenAIDeviceFlow(rw, r, sess)
+			return
+		case "aws_sso":
+			w.pollAWSSSODeviceFlow(rw, r, sess)
+			return
+		}
 	}
 	w.pollDeviceFlow(rw, r, sess)
 }

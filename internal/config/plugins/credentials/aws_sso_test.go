@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
@@ -119,6 +120,30 @@ func TestSigV4AccessKeyID(t *testing.T) {
 				t.Errorf("sigV4AccessKeyID(%q) = %q, want %q", tc.header, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestAWSSSOCredentialOAuthFlow asserts the credential declares the
+// non-standard aws_sso device flow and carries its per-instance start URL
+// + SSO region on the OAuth config (so the flow handler needs no policy
+// lookup). This is what registers the dashboard "Connect" card and makes
+// the SSO token persist under the credential's name.
+func TestAWSSSOCredentialOAuthFlow(t *testing.T) {
+	var _ config.OAuthFlowProvider = (*AWSSSOCredential)(nil)
+
+	c := &AWSSSOCredential{StartURL: "https://acme.awsapps.com/start", Region: "eu-west-1"}
+	fl := c.OAuthFlow()
+	if fl == nil {
+		t.Fatal("OAuthFlow() returned nil")
+	}
+	if fl.Flow != "aws_sso" {
+		t.Errorf("Flow = %q, want aws_sso", fl.Flow)
+	}
+	if fl.OAuth.AuthURL != "https://acme.awsapps.com/start" {
+		t.Errorf("OAuth.AuthURL = %q, want the start URL", fl.OAuth.AuthURL)
+	}
+	if fl.OAuth.DeviceURL != "eu-west-1" {
+		t.Errorf("OAuth.DeviceURL = %q, want the SSO region", fl.OAuth.DeviceURL)
 	}
 }
 
