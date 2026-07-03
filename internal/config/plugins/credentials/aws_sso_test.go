@@ -51,6 +51,34 @@ func mockSSO(t *testing.T) *int32 {
 	return &calls
 }
 
+// mockSSOPerAccount returns creds whose access-key-id encodes the
+// requested account, so a test can prove a request routes to the right
+// role. account_id / role_name arrive as query params (verified against
+// the sso serializer).
+func mockSSOPerAccount(t *testing.T) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		account := r.URL.Query().Get("account_id")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"roleCredentials": map[string]any{
+				"accessKeyId":     "AKID-" + account,
+				"secretAccessKey": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+				"sessionToken":    "sess-" + account,
+				"expiration":      time.Now().Add(time.Hour).UnixMilli(),
+			},
+		})
+	}))
+	prev := newSSOClient
+	newSSOClient = func(region string) *sso.Client {
+		return sso.New(sso.Options{Region: region, BaseEndpoint: aws.String(srv.URL), Credentials: aws.AnonymousCredentials{}})
+	}
+	t.Cleanup(func() {
+		newSSOClient = prev
+		srv.Close()
+	})
+}
+
 func ssoCredFixture() *AWSSSOCredential {
 	return &AWSSSOCredential{
 		StartURL: "https://acme.awsapps.com/start",
@@ -173,6 +201,36 @@ func TestAWSSSOCredentialNoSSOTokenErrors(t *testing.T) {
 	err := c.SignHTTPRequest(context.Background(), req, runtime.Secret{}, struct{}{})
 	if err == nil || !strings.Contains(err.Error(), "SSO token") {
 		t.Fatalf("err = %v, want one mentioning the missing SSO token", err)
+	}
+}
+
+// TestAWSSSOCredentialMultiRoleSwitching verifies one credential with two
+// role mappings routes each request to the role its placeholder selects,
+// minting a distinct identity per role within a single session.
+func TestAWSSSOCredentialMultiRoleSwitching(t *testing.T) {
+	mockSSOPerAccount(t)
+	c := &AWSSSOCredential{
+		StartURL: "https://acme.awsapps.com/start",
+		Region:   "us-east-1",
+		Roles: []AWSSSORole{
+			{AccountID: "111111111111", RoleName: "Admin", Placeholder: "AKIAPROD0ADMIN000000"},
+			{AccountID: "222222222222", RoleName: "ReadOnly", Placeholder: "AKIADEV00READONLY000"},
+		},
+	}
+
+	mint := func(placeholder string) string {
+		req := signedReq(t, placeholder)
+		if err := c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{}); err != nil {
+			t.Fatalf("sign %s: %v", placeholder, err)
+		}
+		return req.Header.Get("Authorization")
+	}
+
+	if auth := mint("AKIAPROD0ADMIN000000"); !strings.Contains(auth, "Credential=AKID-111111111111/") {
+		t.Errorf("prod-admin request minted %q, want the account-111111111111 identity", auth)
+	}
+	if auth := mint("AKIADEV00READONLY000"); !strings.Contains(auth, "Credential=AKID-222222222222/") {
+		t.Errorf("dev-readonly request minted %q, want the account-222222222222 identity", auth)
 	}
 }
 

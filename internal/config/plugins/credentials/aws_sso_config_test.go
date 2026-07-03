@@ -70,6 +70,69 @@ profile "default" {
 	}
 }
 
+// TestAWSSSOCredentialConfigRejectsBadRoles asserts the Validate hook
+// surfaces load-time errors for role mappings that would dispatch
+// ambiguously (duplicate placeholder) or fail (empty fields).
+func TestAWSSSOCredentialConfigRejectsBadRoles(t *testing.T) {
+	base := `gateway {
+  state_dir  = "/opt/clawpatrol"
+  public_url = "https://gw.example.test"
+  wireguard { subnet_cidr = "10.55.0.0/24" }
+}
+
+endpoint "https" "aws" { hosts = ["*.amazonaws.com"] }
+`
+	cases := []struct {
+		name, cred, wantErr string
+	}{
+		{
+			name: "duplicate placeholder",
+			cred: `credential "aws_sso_credential" "sso" {
+  start_url = "https://acme.awsapps.com/start"
+  region    = "us-east-1"
+  endpoint  = https.aws
+  role {
+    account_id  = "111111111111"
+    role_name   = "Admin"
+    placeholder = "AKIADUP0000000000000"
+  }
+  role {
+    account_id  = "222222222222"
+    role_name   = "ReadOnly"
+    placeholder = "AKIADUP0000000000000"
+  }
+}`,
+			wantErr: "duplicate placeholder",
+		},
+		{
+			name: "empty role field",
+			cred: `credential "aws_sso_credential" "sso" {
+  start_url = "https://acme.awsapps.com/start"
+  region    = "us-east-1"
+  endpoint  = https.aws
+  role {
+    account_id  = "111111111111"
+    role_name   = ""
+    placeholder = "AKIAPROD0ADMIN000000"
+  }
+}`,
+			wantErr: "required",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			src := base + tc.cred + "\n\nprofile \"default\" { credentials = [aws_sso_credential.sso] }\n"
+			_, diags := config.LoadBytes([]byte(src), "aws_sso_bad.hcl")
+			if !diags.HasErrors() {
+				t.Fatalf("expected a load error for %s, got none", tc.name)
+			}
+			if !strings.Contains(diags.Error(), tc.wantErr) {
+				t.Errorf("diags = %v, want one mentioning %q", diags, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestAWSSSOCredentialConfigRoundTrips asserts the Emit hook serializes
 // the credential back to HCL that re-parses to an equivalent config
 // (start_url, region, and both role blocks survive).

@@ -36,6 +36,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sso"
+	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
 
@@ -278,15 +279,55 @@ func (c *AWSSSOCredential) OAuthFlow() *config.OAuthIntegration {
 // so there is no ambient default identity (a no-profile call has no
 // creds and is denied). See akefirad/clawpatrol#5.
 
+// validateAWSSSO rejects configs that would dispatch ambiguously or fail
+// the SSO login: a distinct placeholder per role is what lets the gateway
+// route a request to the right role, so duplicates (or empty fields) are
+// load-time errors rather than silent request-time surprises.
+func validateAWSSSO(decoded any, name string, _ *config.BuildCtx) hcl.Diagnostics {
+	c := decoded.(*AWSSSOCredential)
+	var diags hcl.Diagnostics
+	add := func(msg string) {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  "invalid aws_sso_credential",
+			Detail:   fmt.Sprintf("credential %q: %s", name, msg),
+		})
+	}
+	if c.StartURL == "" {
+		add("start_url is required (the IAM Identity Center access-portal URL)")
+	}
+	if c.Region == "" {
+		add("region is required (the SSO region)")
+	}
+	if len(c.Roles) == 0 {
+		add("must declare at least one role mapping")
+	}
+	seen := map[string]bool{}
+	for i, r := range c.Roles {
+		if r.AccountID == "" || r.RoleName == "" || r.Placeholder == "" {
+			add(fmt.Sprintf("role #%d: account_id, role_name, and placeholder are all required", i+1))
+		}
+		if r.Placeholder == "" {
+			continue
+		}
+		if seen[r.Placeholder] {
+			add(fmt.Sprintf("duplicate placeholder %q — each role needs a distinct placeholder access-key-id so requests route unambiguously", r.Placeholder))
+		}
+		seen[r.Placeholder] = true
+	}
+	return diags
+}
+
 func init() {
 	var _ runtime.HTTPRequestSigner = (*AWSSSOCredential)(nil)
 	var _ config.OAuthFlowProvider = (*AWSSSOCredential)(nil)
 	config.Register(&config.Plugin{
-		Kind:    config.KindCredential,
-		Type:    "aws_sso_credential",
-		New:     newer[AWSSSOCredential](),
-		Runtime: (*AWSSSOCredential)(nil),
-		Build:   passthrough,
+		Kind:     config.KindCredential,
+		Type:     "aws_sso_credential",
+		New:      newer[AWSSSOCredential](),
+		Runtime:  (*AWSSSOCredential)(nil),
+		Validate: validateAWSSSO,
+		Build:    passthrough,
 		Emit: func(body any, _ string, hb *hclwrite.Body) {
 			c := body.(*AWSSSOCredential)
 			hb.SetAttributeValue("start_url", cty.StringVal(c.StartURL))
