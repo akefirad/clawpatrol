@@ -2,31 +2,40 @@ package credentials
 
 // aws_sso_credential: AWS IAM Identity Center (SSO) credentials.
 //
-// One authentication (start_url + SSO region → one device login → one
-// stored SSO token) fans out to many (account, role) mappings, each
+// One authentication (start_url + SSO region → one dashboard device login
+// → one stored SSO token) fans out to many (account, role) mappings, each
 // bound to a distinct placeholder access-key-id. The credential
 // SELF-DISPATCHES: it reads the placeholder access-key-id the agent's
-// aws-cli signed with out of the SigV4 Authorization header, selects
-// the matching role mapping, and re-signs the request with that role's
-// real credentials — the agent never holds real creds. Because a
-// single credential covers all roles, no core disambiguator is used or
-// needed (role selection is internal to this credential).
+// aws-cli signed with out of the SigV4 Authorization header, selects the
+// matching role mapping, mints that role's real (short-lived) credentials
+// via sso:GetRoleCredentials using the stored SSO token, and re-signs the
+// request with them — the agent never holds real creds. Because a single
+// credential covers all roles, no core disambiguator is used (role
+// selection is internal to this credential).
 //
-// SLICE 1 (this file, initial cut — see akefirad/clawpatrol#2): schema +
-// self-dispatch + re-sign for a role sourcing its "real" creds from the
-// credential's SEEDED secret slots (no live SSO yet). Later slices add
-// the SSO device-login (#3), live sso:GetRoleCredentials + caching (#4),
-// per-request multi-role switching + unknown→deny (#5), token refresh
-// (#6), and policy examples (#7). Re-signing reuses aws_credential's
-// reSignProxiedRequest verbatim (same package; that method uses no
-// receiver state) — no modification to aws.go.
+// Credential source: the SSO access token is delivered as sec.Bytes via
+// the OAuthRegistry (see OAuthFlow + the gateway's OAuth-flow secret path);
+// the dashboard device login that obtains it lives in the gateway's OAuth
+// engine (Flow="aws_sso"). Per-role temporary credentials are cached in
+// memory (aws.CredentialsCache: expiry-margin + single-flight refresh), so
+// a burst of requests triggers at most one GetRoleCredentials call and the
+// cache repopulates from the stored token after a restart. SSO-token
+// refresh for long sessions is a later slice (akefirad/clawpatrol#6);
+// multi-role switching + explicit no-profile-deny semantics land in #5.
+//
+// Re-signing reuses aws_credential's reSignProxiedRequest verbatim (same
+// package; that method uses no receiver state) — no modification to aws.go.
 
 import (
 	"context"
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sso"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
 
@@ -34,10 +43,23 @@ import (
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
-// AWSSSORole is one switchable (account, role) mapping. Placeholder is
-// a distinct access-key-id the agent signs with (seeded into the
-// agent's ~/.aws/credentials as a profile) so the gateway can tell
-// which role a request intends.
+// awsSSOExpiryWindow refreshes cached role credentials this long before
+// their true expiry, so a request never signs with about-to-expire creds
+// and the refresh (a GetRoleCredentials call) happens ahead of expiry.
+const awsSSOExpiryWindow = 5 * time.Minute
+
+// newSSOClient builds the sso client for a region. A package var so tests
+// can point it at a mock server. sso:GetRoleCredentials is unauthenticated
+// (the SSO access token is passed as a parameter), so no AWS credentials
+// are configured.
+var newSSOClient = func(region string) *sso.Client {
+	return sso.New(sso.Options{Region: region})
+}
+
+// AWSSSORole is one switchable (account, role) mapping. Placeholder is a
+// distinct access-key-id the agent signs with (seeded into the agent's
+// ~/.aws/credentials as a profile) so the gateway can tell which role a
+// request intends.
 type AWSSSORole struct {
 	AccountID   string `hcl:"account_id"`
 	RoleName    string `hcl:"role_name"`
@@ -55,43 +77,39 @@ type AWSSSOCredential struct {
 	// Roles is the set of switchable (account, role) mappings, each
 	// keyed by a distinct placeholder access-key-id.
 	Roles []AWSSSORole `hcl:"role,block"`
+
+	// rt holds request-time cache state (SSO client + per-role credential
+	// caches + latest token). Pointer + lazy alloc so the config body
+	// carries no lock (never copy-locked) and hand-built instances in
+	// tests work without a Build step. Guarded by awsSSORuntimeMu for
+	// allocation; awsSSORuntime.mu guards its own contents.
+	rt *awsSSORuntime
 }
 
-// roleForPlaceholder returns the role mapping whose placeholder equals
-// the given access-key-id, or nil when none matches.
-func (c *AWSSSOCredential) roleForPlaceholder(akid string) *AWSSSORole {
-	for i := range c.Roles {
-		if c.Roles[i].Placeholder != "" && c.Roles[i].Placeholder == akid {
-			return &c.Roles[i]
-		}
-	}
-	return nil
+// awsSSORuntime is the per-credential request-time cache.
+type awsSSORuntime struct {
+	mu     sync.Mutex
+	client *sso.Client
+	caches map[string]*aws.CredentialsCache // key: "<account>/<role>"
+	token  string                           // latest SSO access token
 }
 
-// SignHTTPRequest is part of the clawpatrol plugin API. It self-dispatches
-// on the placeholder access-key-id the agent signed with, then re-signs
-// the request with that role's real credentials.
-//
-// SLICE 1: the real credentials come from the credential's seeded secret
-// slots (the `sec` passed in). A later slice sources them per-role from
-// the SSO credential cache and passes a per-role runtime.Secret here
-// instead — the re-sign call is identical.
-func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Request, sec runtime.Secret, _ any) error {
-	akid := sigV4AccessKeyID(req.Header.Get("Authorization"))
-	if akid == "" {
-		return fmt.Errorf("aws_sso_credential: request carries no SigV4 access-key-id to route on")
+func (rt *awsSSORuntime) currentToken() string {
+	rt.mu.Lock()
+	defer rt.mu.Unlock()
+	return rt.token
+}
+
+// awsSSORuntimeMu guards lazy allocation of AWSSSOCredential.rt only.
+var awsSSORuntimeMu sync.Mutex
+
+func (c *AWSSSOCredential) runtimeState() *awsSSORuntime {
+	awsSSORuntimeMu.Lock()
+	defer awsSSORuntimeMu.Unlock()
+	if c.rt == nil {
+		c.rt = &awsSSORuntime{caches: map[string]*aws.CredentialsCache{}}
 	}
-	if role := c.roleForPlaceholder(akid); role == nil {
-		// Unknown placeholder → no role. Fail closed rather than
-		// re-signing under an unintended identity. (Multi-role dispatch
-		// and the explicit no-profile-deny semantics land in a later slice.)
-		return fmt.Errorf("aws_sso_credential: no role mapping for placeholder access-key-id %q", akid)
-	}
-	// Re-sign with the (seeded, for now) real creds. reSignProxiedRequest
-	// derives service/region from the request and reuses/recomputes the
-	// payload hash; it uses no AWSCredential receiver state, so a
-	// zero-value receiver is fine and avoids duplicating the logic.
-	return (&AWSCredential{}).reSignProxiedRequest(ctx, req, sec)
+	return c.rt
 }
 
 // sigV4AccessKeyID extracts the access-key-id from a SigV4 Authorization
@@ -116,21 +134,118 @@ func sigV4AccessKeyID(authHeader string) string {
 	return parts[0]
 }
 
-// SecretSlots is part of the clawpatrol plugin API.
-//
-// SLICE 1: the seeded per-role credentials live in these slots (same slot
-// names aws_credential uses, so the shared reSignProxiedRequest reads
-// them). A later slice replaces the seeded slots with the SSO token
-// material once live sso:GetRoleCredentials lands.
-func (*AWSSSOCredential) SecretSlots() []config.SecretSlot {
-	return []config.SecretSlot{
-		{Name: "access_key_id", Label: "Seeded AWS access key ID",
-			Description: "Slice-1 seed for re-signing; superseded by SSO-derived per-role creds in a later slice."},
-		{Name: "secret_access_key", Label: "Seeded AWS secret access key",
-			Description: "Slice-1 seed."},
-		{Name: "session_token", Label: "Seeded AWS session token (optional)",
-			Description: "Slice-1 seed; present for STS-issued temporary credentials."},
+// roleForPlaceholder returns the role mapping whose placeholder equals
+// the given access-key-id, or nil when none matches.
+func (c *AWSSSOCredential) roleForPlaceholder(akid string) *AWSSSORole {
+	for i := range c.Roles {
+		if c.Roles[i].Placeholder != "" && c.Roles[i].Placeholder == akid {
+			return &c.Roles[i]
+		}
 	}
+	return nil
+}
+
+// roleCreds returns the (cached) temporary credentials for a role, minting
+// them via sso:GetRoleCredentials with the current SSO token on a cache
+// miss / near-expiry. Refresh is expiry-margin + single-flight (both from
+// aws.CredentialsCache).
+func (c *AWSSSOCredential) roleCreds(ctx context.Context, role AWSSSORole, ssoToken string) (aws.Credentials, error) {
+	rt := c.runtimeState()
+	rt.mu.Lock()
+	rt.token = ssoToken
+	if rt.client == nil {
+		rt.client = newSSOClient(c.Region)
+	}
+	key := role.AccountID + "/" + role.RoleName
+	cache := rt.caches[key]
+	if cache == nil {
+		prov := &ssoRoleProvider{
+			client:    rt.client,
+			accountID: role.AccountID,
+			roleName:  role.RoleName,
+			tokenFn:   rt.currentToken,
+		}
+		cache = aws.NewCredentialsCache(prov, func(o *aws.CredentialsCacheOptions) {
+			o.ExpiryWindow = awsSSOExpiryWindow
+		})
+		rt.caches[key] = cache
+	}
+	rt.mu.Unlock()
+	return cache.Retrieve(ctx)
+}
+
+// ssoRoleProvider is the aws.CredentialsProvider the per-role cache wraps:
+// each Retrieve mints fresh temporary credentials for one (account, role)
+// from the current SSO token.
+type ssoRoleProvider struct {
+	client    *sso.Client
+	accountID string
+	roleName  string
+	tokenFn   func() string
+}
+
+func (p *ssoRoleProvider) Retrieve(ctx context.Context) (aws.Credentials, error) {
+	token := p.tokenFn()
+	if token == "" {
+		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: no SSO token (connect AWS SSO in the dashboard)")
+	}
+	out, err := p.client.GetRoleCredentials(ctx, &sso.GetRoleCredentialsInput{
+		AccessToken: aws.String(token),
+		AccountId:   aws.String(p.accountID),
+		RoleName:    aws.String(p.roleName),
+	})
+	if err != nil {
+		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: GetRoleCredentials(%s/%s): %w", p.accountID, p.roleName, err)
+	}
+	rc := out.RoleCredentials
+	if rc == nil || aws.ToString(rc.AccessKeyId) == "" {
+		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: GetRoleCredentials(%s/%s) returned no credentials", p.accountID, p.roleName)
+	}
+	return aws.Credentials{
+		AccessKeyID:     aws.ToString(rc.AccessKeyId),
+		SecretAccessKey: aws.ToString(rc.SecretAccessKey),
+		SessionToken:    aws.ToString(rc.SessionToken),
+		Source:          "aws_sso_credential",
+		CanExpire:       true,
+		// SSO returns Expiration as epoch milliseconds.
+		Expires: time.UnixMilli(rc.Expiration),
+	}, nil
+}
+
+// SignHTTPRequest is part of the clawpatrol plugin API. It self-dispatches
+// on the placeholder access-key-id the agent signed with, mints that
+// role's real credentials (cached) from the stored SSO token, and re-signs
+// the request with them.
+func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Request, sec runtime.Secret, _ any) error {
+	akid := sigV4AccessKeyID(req.Header.Get("Authorization"))
+	if akid == "" {
+		return fmt.Errorf("aws_sso_credential: request carries no SigV4 access-key-id to route on")
+	}
+	role := c.roleForPlaceholder(akid)
+	if role == nil {
+		// Unknown placeholder → no role. Fail closed rather than
+		// re-signing under an unintended identity. (Multi-role dispatch
+		// and the explicit no-profile-deny semantics land in a later slice.)
+		return fmt.Errorf("aws_sso_credential: no role mapping for placeholder access-key-id %q", akid)
+	}
+	ssoToken := string(sec.Bytes)
+	if ssoToken == "" {
+		return fmt.Errorf("aws_sso_credential: no SSO token available (connect AWS SSO in the dashboard)")
+	}
+	creds, err := c.roleCreds(ctx, *role, ssoToken)
+	if err != nil {
+		return err
+	}
+	// Hand the minted creds to aws_credential's re-signer via a secret it
+	// understands; reSignProxiedRequest derives service/region from the
+	// request and reuses/recomputes the payload hash. It uses no
+	// AWSCredential receiver state, so a zero-value receiver is fine.
+	roleSec := runtime.Secret{Extras: map[string]string{
+		"access_key_id":     creds.AccessKeyID,
+		"secret_access_key": creds.SecretAccessKey,
+		"session_token":     creds.SessionToken,
+	}}
+	return (&AWSCredential{}).reSignProxiedRequest(ctx, req, roleSec)
 }
 
 // OAuthFlow is part of the clawpatrol plugin API. It registers this
