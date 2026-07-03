@@ -2,15 +2,55 @@ package credentials
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sso"
 
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
-// roleFixture is a single seeded role mapping used across the tests.
+// mockSSO stands up a fake sso GetRoleCredentials endpoint and points
+// newSSOClient at it. It returns a call counter so tests can assert
+// caching (at most one mint per role). Minted creds are the canonical AWS
+// example key so reSignProxiedRequest produces a valid SigV4 signature.
+func mockSSO(t *testing.T) *int32 {
+	t.Helper()
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"roleCredentials": map[string]any{
+				"accessKeyId":     "AKIDEXAMPLE",
+				"secretAccessKey": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+				"sessionToken":    "FwoGZXIvYXdzEXAMPLE",
+				"expiration":      time.Now().Add(time.Hour).UnixMilli(),
+			},
+		})
+	}))
+	prev := newSSOClient
+	newSSOClient = func(region string) *sso.Client {
+		return sso.New(sso.Options{
+			Region:       region,
+			BaseEndpoint: aws.String(srv.URL),
+			Credentials:  aws.AnonymousCredentials{},
+		})
+	}
+	t.Cleanup(func() {
+		newSSOClient = prev
+		srv.Close()
+	})
+	return &calls
+}
+
 func ssoCredFixture() *AWSSSOCredential {
 	return &AWSSSOCredential{
 		StartURL: "https://acme.awsapps.com/start",
@@ -21,12 +61,10 @@ func ssoCredFixture() *AWSSSOCredential {
 	}
 }
 
-// seededSecret carries the (slice-1) "real" creds the gateway re-signs with.
-func seededSecret() runtime.Secret {
-	return runtime.Secret{Extras: map[string]string{
-		"access_key_id":     "AKIDEXAMPLE",
-		"secret_access_key": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-	}}
+// ssoTokenSecret is the SSO access token the OAuthRegistry hands the
+// credential at sign time.
+func ssoTokenSecret() runtime.Secret {
+	return runtime.Secret{Kind: "oauth_bearer", Bytes: []byte("sso-access-token")}
 }
 
 // signedReq builds a request the agent's aws-cli would have signed with
@@ -44,16 +82,17 @@ func signedReq(t *testing.T, placeholderAKID string) *http.Request {
 	return req
 }
 
-// TestAWSSSOCredentialReSignsSelectedRole verifies the credential
-// self-dispatches on the placeholder access-key-id, matches the role
-// mapping, and re-signs the request with the (seeded) real creds — the
-// client's placeholder signature is replaced and the credential scope
-// from the incoming header is preserved.
-func TestAWSSSOCredentialReSignsSelectedRole(t *testing.T) {
+// TestAWSSSOCredentialMintsAndReSigns verifies the credential self-dispatches
+// on the placeholder access-key-id, mints that role's real creds from the
+// SSO token via GetRoleCredentials, and re-signs the request with them —
+// the client's placeholder signature is replaced and the incoming scope is
+// preserved.
+func TestAWSSSOCredentialMintsAndReSigns(t *testing.T) {
+	mockSSO(t)
 	c := ssoCredFixture()
 	req := signedReq(t, "AKIAPROD0ADMIN000000")
 
-	if err := c.SignHTTPRequest(context.Background(), req, seededSecret(), struct{}{}); err != nil {
+	if err := c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{}); err != nil {
 		t.Fatalf("sign: %v", err)
 	}
 
@@ -65,42 +104,75 @@ func TestAWSSSOCredentialReSignsSelectedRole(t *testing.T) {
 		t.Errorf("Authorization still carries the client placeholder signature: %q", auth)
 	}
 	if !strings.Contains(auth, "Credential=AKIDEXAMPLE/") {
-		t.Errorf("Authorization = %q, want re-signed with the seeded key AKIDEXAMPLE", auth)
+		t.Errorf("Authorization = %q, want re-signed with the minted role key AKIDEXAMPLE", auth)
 	}
 	if !strings.Contains(auth, "/us-west-2/dynamodb/aws4_request") {
 		t.Errorf("Authorization = %q, want the scope from the incoming header (us-west-2/dynamodb)", auth)
 	}
+	// STS-issued role creds carry a session token → the signer must stamp it.
+	if req.Header.Get("X-Amz-Security-Token") != "FwoGZXIvYXdzEXAMPLE" {
+		t.Errorf("X-Amz-Security-Token = %q, want the minted role session token", req.Header.Get("X-Amz-Security-Token"))
+	}
 }
 
-// TestAWSSSOCredentialUnknownPlaceholderFailsClosed verifies a request
-// whose placeholder matches no role mapping is rejected and left
-// un-re-signed (fail closed — no signing under an unintended identity).
+// TestAWSSSOCredentialRoleCredsCached verifies a second request for the same
+// role serves cached creds — at most one GetRoleCredentials mint.
+func TestAWSSSOCredentialRoleCredsCached(t *testing.T) {
+	calls := mockSSO(t)
+	c := ssoCredFixture()
+	for i := 0; i < 3; i++ {
+		if err := c.SignHTTPRequest(context.Background(), signedReq(t, "AKIAPROD0ADMIN000000"), ssoTokenSecret(), struct{}{}); err != nil {
+			t.Fatalf("sign %d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Errorf("GetRoleCredentials called %d times, want 1 (creds must be cached)", got)
+	}
+}
+
+// TestAWSSSOCredentialUnknownPlaceholderFailsClosed verifies a request whose
+// placeholder matches no role mapping is rejected, left un-re-signed, and
+// never triggers a mint.
 func TestAWSSSOCredentialUnknownPlaceholderFailsClosed(t *testing.T) {
+	calls := mockSSO(t)
 	c := ssoCredFixture()
 	req := signedReq(t, "AKIAUNKNOWN000000000")
 
-	err := c.SignHTTPRequest(context.Background(), req, seededSecret(), struct{}{})
-	if err == nil {
-		t.Fatal("expected an error for an unmatched placeholder access-key-id")
+	err := c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "no role mapping") {
+		t.Fatalf("err = %v, want one mentioning the missing role mapping", err)
 	}
-	if !strings.Contains(err.Error(), "no role mapping") {
-		t.Errorf("err = %v, want one mentioning the missing role mapping", err)
+	if strings.Contains(req.Header.Get("Authorization"), "deadbeef") == false {
+		t.Errorf("request was re-signed despite no matching role; Authorization = %q", req.Header.Get("Authorization"))
 	}
-	if auth := req.Header.Get("Authorization"); !strings.Contains(auth, "deadbeef") {
-		t.Errorf("request was re-signed despite no matching role; Authorization = %q", auth)
+	if atomic.LoadInt32(calls) != 0 {
+		t.Error("GetRoleCredentials was called for an unmatched placeholder")
 	}
 }
 
 // TestAWSSSOCredentialNoSigV4Errors verifies a request without a parseable
 // SigV4 access-key-id is rejected (nothing to route on).
 func TestAWSSSOCredentialNoSigV4Errors(t *testing.T) {
+	mockSSO(t)
 	c := ssoCredFixture()
 	req, err := http.NewRequest("GET", "https://dynamodb.eu-west-1.amazonaws.com/", nil)
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	if err := c.SignHTTPRequest(context.Background(), req, seededSecret(), struct{}{}); err == nil {
+	if err := c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{}); err == nil {
 		t.Fatal("expected an error when the request carries no SigV4 access-key-id")
+	}
+}
+
+// TestAWSSSOCredentialNoSSOTokenErrors verifies that when the role matches
+// but no SSO token is available (not connected), signing fails closed.
+func TestAWSSSOCredentialNoSSOTokenErrors(t *testing.T) {
+	mockSSO(t)
+	c := ssoCredFixture()
+	req := signedReq(t, "AKIAPROD0ADMIN000000")
+	err := c.SignHTTPRequest(context.Background(), req, runtime.Secret{}, struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "SSO token") {
+		t.Fatalf("err = %v, want one mentioning the missing SSO token", err)
 	}
 }
 
@@ -120,6 +192,22 @@ func TestSigV4AccessKeyID(t *testing.T) {
 				t.Errorf("sigV4AccessKeyID(%q) = %q, want %q", tc.header, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestAWSSSORoleForPlaceholder(t *testing.T) {
+	c := &AWSSSOCredential{Roles: []AWSSSORole{
+		{AccountID: "111111111111", RoleName: "Admin", Placeholder: "AKIAPROD0ADMIN000000"},
+		{AccountID: "222222222222", RoleName: "ReadOnly", Placeholder: "AKIADEV00READONLY000"},
+	}}
+	if r := c.roleForPlaceholder("AKIADEV00READONLY000"); r == nil || r.RoleName != "ReadOnly" {
+		t.Errorf("roleForPlaceholder(dev) = %+v, want the ReadOnly role", r)
+	}
+	if r := c.roleForPlaceholder("AKIANOPE000000000000"); r != nil {
+		t.Errorf("roleForPlaceholder(unknown) = %+v, want nil", r)
+	}
+	if r := c.roleForPlaceholder(""); r != nil {
+		t.Errorf("roleForPlaceholder(empty) = %+v, want nil (empty must not match empty placeholder)", r)
 	}
 }
 
@@ -144,21 +232,5 @@ func TestAWSSSOCredentialOAuthFlow(t *testing.T) {
 	}
 	if fl.OAuth.DeviceURL != "eu-west-1" {
 		t.Errorf("OAuth.DeviceURL = %q, want the SSO region", fl.OAuth.DeviceURL)
-	}
-}
-
-func TestAWSSSORoleForPlaceholder(t *testing.T) {
-	c := &AWSSSOCredential{Roles: []AWSSSORole{
-		{AccountID: "111111111111", RoleName: "Admin", Placeholder: "AKIAPROD0ADMIN000000"},
-		{AccountID: "222222222222", RoleName: "ReadOnly", Placeholder: "AKIADEV00READONLY000"},
-	}}
-	if r := c.roleForPlaceholder("AKIADEV00READONLY000"); r == nil || r.RoleName != "ReadOnly" {
-		t.Errorf("roleForPlaceholder(dev) = %+v, want the ReadOnly role", r)
-	}
-	if r := c.roleForPlaceholder("AKIANOPE000000000000"); r != nil {
-		t.Errorf("roleForPlaceholder(unknown) = %+v, want nil", r)
-	}
-	if r := c.roleForPlaceholder(""); r != nil {
-		t.Errorf("roleForPlaceholder(empty) = %+v, want nil (empty must not match empty placeholder)", r)
 	}
 }
