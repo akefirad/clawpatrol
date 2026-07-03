@@ -133,6 +133,29 @@ func (*AWSSSOCredential) SecretSlots() []config.SecretSlot {
 	}
 }
 
+// OAuthFlow is part of the clawpatrol plugin API. It registers this
+// credential with the gateway's OAuth registry so the dashboard renders a
+// "Connect" card and the SSO token persists like every other OAuth-flow
+// credential. AWS SSO's device flow is non-standard (JSON ssooidc
+// RegisterClient / StartDeviceAuthorization / CreateToken), so it runs
+// under the dedicated Flow="aws_sso" branch in the gateway's OAuth engine.
+//
+// The per-instance start URL + SSO region ride on the OAuth config so the
+// flow handler needs no policy lookup: AuthURL carries the access-portal
+// start URL, and DeviceURL carries the SSO region (the ssooidc endpoint is
+// derived from it). No client id/secret/token are set here — the device
+// flow registers a client dynamically and the registry owns the token.
+func (c *AWSSSOCredential) OAuthFlow() *config.OAuthIntegration {
+	return &config.OAuthIntegration{
+		Type: "aws_sso",
+		Flow: "aws_sso",
+		OAuth: config.OAuthConfig{
+			AuthURL:   c.StartURL,
+			DeviceURL: c.Region,
+		},
+	}
+}
+
 // Note: aws_sso_credential intentionally does NOT implement
 // EnvPushdownProvider. Unlike aws_credential it pushes no default
 // AWS_ACCESS_KEY_ID/SECRET — role selection is per-request via the
@@ -142,6 +165,7 @@ func (*AWSSSOCredential) SecretSlots() []config.SecretSlot {
 
 func init() {
 	var _ runtime.HTTPRequestSigner = (*AWSSSOCredential)(nil)
+	var _ config.OAuthFlowProvider = (*AWSSSOCredential)(nil)
 	config.Register(&config.Plugin{
 		Kind:    config.KindCredential,
 		Type:    "aws_sso_credential",
