@@ -254,6 +254,14 @@ func (p *ssoRoleProvider) Retrieve(ctx context.Context) (aws.Credentials, error)
 	if rc == nil || aws.ToString(rc.AccessKeyId) == "" {
 		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: GetRoleCredentials(%s/%s) returned no credentials", p.accountID, p.roleName)
 	}
+	// A zero Expiration would become time.UnixMilli(0) = 1970, which with
+	// CanExpire:true makes aws.CredentialsCache treat the entry as already
+	// expired — so every request re-mints (latency + AWS throttling /
+	// TooManyRequestsException). AWS always populates it; treat a zero as an
+	// error rather than caching a permanently-expired entry.
+	if rc.Expiration == 0 {
+		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: GetRoleCredentials(%s/%s) returned no expiration", p.accountID, p.roleName)
+	}
 	return aws.Credentials{
 		AccessKeyID:     aws.ToString(rc.AccessKeyId),
 		SecretAccessKey: aws.ToString(rc.SecretAccessKey),

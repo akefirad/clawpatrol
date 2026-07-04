@@ -204,6 +204,35 @@ func TestAWSSSOCredentialNoSSOTokenErrors(t *testing.T) {
 	}
 }
 
+// TestAWSSSOCredentialZeroExpirationErrors verifies that creds returned with
+// a zero expiration are rejected rather than cached as a permanently-expired
+// entry (which would re-mint on every request — latency + AWS throttling).
+func TestAWSSSOCredentialZeroExpirationErrors(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"roleCredentials": map[string]any{
+				"accessKeyId":     "AKIDEXAMPLE",
+				"secretAccessKey": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+				"sessionToken":    "FwoGZXIvYXdzEXAMPLE",
+				"expiration":      0,
+			},
+		})
+	}))
+	prev := newSSOClient
+	newSSOClient = func(region string) *sso.Client {
+		return sso.New(sso.Options{Region: region, BaseEndpoint: aws.String(srv.URL), Credentials: aws.AnonymousCredentials{}})
+	}
+	t.Cleanup(func() { newSSOClient = prev; srv.Close() })
+
+	c := ssoCredFixture()
+	req := signedReq(t, "AKIAPROD0ADMIN000000")
+	err := c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "no expiration") {
+		t.Fatalf("err = %v, want one mentioning the missing expiration", err)
+	}
+}
+
 // TestAWSSSOCredentialMultiRoleSwitching verifies one credential with two
 // role mappings routes each request to the role its placeholder selects,
 // minting a distinct identity per role within a single session.
