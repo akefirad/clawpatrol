@@ -238,3 +238,32 @@ func TestPollAWSSSODeviceFlowTerminalErrors(t *testing.T) {
 		})
 	}
 }
+
+// TestPollAWSSSODeviceFlowTransientKeepsSession verifies a transient
+// CreateToken failure (here AWS InternalServerException, a documented-retryable
+// 5xx) does NOT abort the device login: it returns a 5xx and keeps the session
+// so the dashboard's next poll tick can recover.
+func TestPollAWSSSODeviceFlowTransientKeepsSession(t *testing.T) {
+	awsSSOMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Amzn-Errortype", "InternalServerException")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"__type":"InternalServerException","message":"transient"}`))
+	})
+	w, reg := newAWSSSOTestMux()
+	w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: "cid|csec|dc|us-east-1"}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/oauth/device-poll?state=st", nil)
+	w.pollAWSSSODeviceFlow(rec, req, w.sessions["st"])
+
+	if rec.Code < 500 {
+		t.Errorf("status = %d, want a 5xx on a transient error", rec.Code)
+	}
+	if connected, _ := reg.Status("sso"); connected {
+		t.Error("registry shows connected on a transient error — must not persist")
+	}
+	// The session MUST survive so the next poll tick can recover.
+	if _, ok := w.sessions["st"]; !ok {
+		t.Error("session deleted on a transient error; the device login can no longer recover")
+	}
+}

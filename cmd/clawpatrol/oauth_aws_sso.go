@@ -17,6 +17,8 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -26,6 +28,24 @@ import (
 	ssooidctypes "github.com/aws/aws-sdk-go-v2/service/ssooidc/types"
 	"golang.org/x/oauth2"
 )
+
+// isRetryableCreateTokenErr reports whether a CreateToken failure is transient
+// rather than terminal: the oauthUpstreamTimeout deadline / a cancel, a network
+// error, or AWS InternalServerException (a documented-retryable 5xx). Such a
+// blip during the approval window must NOT abort the device login — keep the
+// session so the next poll tick recovers, mirroring pollOpenAIDeviceFlow /
+// pollDeviceFlow (which return a 5xx and keep the session).
+func isRetryableCreateTokenErr(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var ise *ssooidctypes.InternalServerException
+	return errors.As(err, &ise)
+}
 
 // newSSOOIDCClient builds the ssooidc client for a region. A package var
 // so tests can point it at a mock server (ssooidc RegisterClient /
@@ -154,6 +174,15 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 		var slow *ssooidctypes.SlowDownException
 		if errors.As(err, &slow) {
 			writeJSON(rw, map[string]string{"error": "slow_down"})
+			return
+		}
+		// Transient failure (ctx deadline, network blip, AWS 5xx): keep the
+		// session and return a 5xx so the dashboard's next poll tick recovers,
+		// instead of aborting the whole device login on one hiccup during the
+		// approval window. Mirrors the sibling device flows.
+		if isRetryableCreateTokenErr(ctx, err) {
+			log.Printf("aws_sso poll: transient CreateToken error (keeping session): %v", err)
+			http.Error(rw, "aws_sso poll: temporary upstream error", http.StatusBadGateway)
 			return
 		}
 		// Everything below is terminal (the dashboard stops polling on any
