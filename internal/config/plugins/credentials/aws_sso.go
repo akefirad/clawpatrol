@@ -164,16 +164,26 @@ func (c *AWSSSOCredential) roleForPlaceholder(akid string) *AWSSSORole {
 // The per-ROLE temporary credentials are refreshed automatically here (the
 // aws.CredentialsCache re-mints them before expiry). The SSO ACCESS TOKEN
 // itself (ssoToken, delivered via the OAuthRegistry) is NOT refreshed: when
-// it expires (IAM Identity Center default ~8h) GetRoleCredentials starts
-// failing and the operator simply re-connects via the dashboard. That is a
-// graceful degradation, not a break.
+// it expires (IAM Identity Center default ~8h) the operator re-connects via
+// the dashboard.
 //
-// To add refresh later: register an awsSSORefreshSource for Flow=="aws_sso"
-// in the gateway's OAuth setToken switch (mirror anthropicRefreshSource),
-// calling ssooidc CreateToken(grant_type=refresh_token). The open question
-// is WHERE to persist the client secret it needs: the `credentials` table
-// has `client_id` + `refresh_token` but no `client_secret` column. Options
-// (to be decided): pack clientId+clientSecret into the existing client_id
+// What the operator actually sees on expiry: aws_sso has no setToken refresh
+// branch, and the device-flow poll deliberately does NOT persist a refresh
+// token (see oauth_aws_sso.go), so the OAuth layer surfaces the clean error
+// `token expired and refresh token is not set` rather than attempting a
+// refresh against an empty TokenURL (which would log a cryptic `unsupported
+// protocol scheme ""`). GetRoleCredentials is never reached — the token
+// lookup fails first; main.go logs `secret <name>: ... — forwarding without
+// injection` and the request forwards with the placeholder signature (AWS
+// then 403s). Graceful-ish degradation with a legible cause, not a break.
+//
+// To add refresh later: (1) persist the refresh token again in the poll,
+// and (2) register an awsSSORefreshSource for Flow=="aws_sso" in the
+// gateway's OAuth setToken switch (mirror anthropicRefreshSource), calling
+// ssooidc CreateToken(grant_type=refresh_token). The open question is WHERE
+// to persist the client secret it needs: the `credentials` table has
+// `client_id` + `refresh_token` but no `client_secret` column. Options (to
+// be decided): pack clientId+clientSecret into the existing client_id
 // column, add a client_secret column (schema migration), or use the blob
 // store. Parked pending that decision.
 

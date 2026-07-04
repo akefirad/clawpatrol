@@ -159,9 +159,17 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 	}
 
 	tok := &oauth2.Token{
-		AccessToken:  aws.ToString(out.AccessToken),
-		RefreshToken: aws.ToString(out.RefreshToken),
-		TokenType:    aws.ToString(out.TokenType),
+		AccessToken: aws.ToString(out.AccessToken),
+		TokenType:   aws.ToString(out.TokenType),
+		// Deliberately NOT persisting out.RefreshToken until real SSO-token
+		// refresh lands (see the DEFERRED note in aws_sso.go / #6). Nothing
+		// can redeem it yet: aws_sso has no setToken refresh branch, so its
+		// OAuthConfig.TokenURL is empty. If we stored the refresh token, the
+		// oauth2 layer would, on expiry, try to refresh against "" and fail
+		// with a cryptic `unsupported protocol scheme ""`. Omitting it makes
+		// expiry surface as the clean `token expired and refresh token is not
+		// set` — a clear "reconnect AWS SSO" signal. Restore persistence
+		// together with the refresh branch when #6 lands.
 	}
 	if out.ExpiresIn > 0 {
 		tok.Expiry = time.Now().Add(time.Duration(out.ExpiresIn) * time.Second)
