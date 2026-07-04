@@ -146,8 +146,8 @@ func newAWSSSORuntime() *awsSSORuntime {
 
 // buildAWSSSO is the plugin Build hook: it eagerly allocates the request-time
 // runtime state so rt is never nil at request time. This is what lets
-// runtimeState() avoid a process-global allocation lock (see #6). Build
-// returns the same *AWSSSOCredential pointer the runtime stores as its Body.
+// runtimeState() avoid a process-global allocation lock. Build returns the
+// same *AWSSSOCredential pointer the runtime stores as its Body.
 func buildAWSSSO(decoded any, _ string, _ *config.BuildCtx) (any, hcl.Diagnostics) {
 	c := decoded.(*AWSSSOCredential)
 	c.rt = newAWSSSORuntime()
