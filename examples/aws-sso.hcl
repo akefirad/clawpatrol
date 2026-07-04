@@ -73,9 +73,22 @@ credential "aws_sso_credential" "sso" {
 # S3 on its own endpoint so its writes can be gated by HTTP method (S3 is
 # a REST API: GET/HEAD = read, PUT/POST/DELETE = write). These suffixes are
 # longer than the catch-all `*.amazonaws.com` on `https.aws`, so S3 hosts
-# route here (longest matching suffix wins). Host patterns allow a single
-# `*`, so add a `*.s3.<region>.amazonaws.com` entry per region you use
-# (e.g. "*.s3.us-east-1.amazonaws.com") alongside the global ones below.
+# route here (longest matching suffix wins).
+#
+# !!! REGIONAL S3 HOSTS NEED THEIR OWN ENTRIES !!! Host patterns match a
+# SUFFIX and allow a single `*`, so `*.s3.amazonaws.com` does NOT match a
+# regional host like `bucket.s3.us-east-1.amazonaws.com` (its suffix is
+# `.s3.us-east-1.amazonaws.com`). A regional request that isn't listed here
+# falls through to the catch-all `https.aws`, where writes hit
+# `aws-default-deny` instead of `s3-writes-approve` — fail-closed, BUT your
+# HITL approval silently never fires. Add an entry per region AND per
+# addressing style you actually use:
+#   - virtual-hosted, regional:  "*.s3.<region>.amazonaws.com"
+#   - path-style,     regional:  "s3.<region>.amazonaws.com"
+#   - dualstack (IPv6):          "*.s3.dualstack.<region>.amazonaws.com"
+#                                "s3.dualstack.<region>.amazonaws.com"
+# e.g. for us-east-1, add all of: "*.s3.us-east-1.amazonaws.com",
+# "s3.us-east-1.amazonaws.com", "*.s3.dualstack.us-east-1.amazonaws.com".
 endpoint "https" "aws-s3" {
   hosts = ["*.s3.amazonaws.com", "s3.amazonaws.com"]
 }
