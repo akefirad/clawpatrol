@@ -55,6 +55,12 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 	defer cancel()
 
 	client := newSSOOIDCClient(region)
+	// NOTE (akefirad/clawpatrol#6): every Connect registers a fresh OIDC
+	// client. Registrations are valid ~90 days and the AWS CLI caches them
+	// for exactly this reason; re-registering each time is wasteful but
+	// harmless. Caching the registration (client id + secret + expiry, e.g.
+	// in the blob store) is deferred INTO the refresh work: refresh needs the
+	// persisted client_secret anyway, so both are solved together in #6.
 	reg, err := client.RegisterClient(ctx, &ssooidc.RegisterClientInput{
 		ClientName: aws.String("clawpatrol"),
 		ClientType: aws.String("public"),
