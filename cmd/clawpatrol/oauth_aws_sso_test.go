@@ -232,6 +232,23 @@ func TestPollAWSSSODeviceFlowSuccess(t *testing.T) {
 	if connected, _ := reg.Status("sso"); !connected {
 		t.Error("registry Status(sso) not connected — token was not persisted")
 	}
+	// The refresh token the mock returned MUST NOT have been persisted:
+	// aws_sso has no refresh branch and an empty TokenURL, so a stored refresh
+	// token would produce the cryptic `unsupported protocol scheme ""` on
+	// expiry. Read the persisted token back and assert it's empty — this pins
+	// the most safety-relevant intentional behavior in the flow so a future
+	// "helpful" edit that persists it fails the suite.
+	st := reg.get("sso")
+	if st == nil {
+		t.Fatal("no oauth state persisted for sso")
+	}
+	got, err := st.source.Token()
+	if err != nil {
+		t.Fatalf("read back persisted token: %v", err)
+	}
+	if got.RefreshToken != "" {
+		t.Errorf("persisted refresh_token = %q, want empty (aws_sso must drop it until refresh lands)", got.RefreshToken)
+	}
 	// Session must be consumed on success.
 	if _, ok := w.sessions["st"]; ok {
 		t.Error("session not deleted after successful token exchange")
