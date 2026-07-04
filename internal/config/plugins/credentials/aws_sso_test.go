@@ -168,7 +168,7 @@ func TestAWSSSOCredentialUnknownPlaceholderFailsClosed(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "no role mapping") {
 		t.Fatalf("err = %v, want one mentioning the missing role mapping", err)
 	}
-	if strings.Contains(req.Header.Get("Authorization"), "deadbeef") == false {
+	if !strings.Contains(req.Header.Get("Authorization"), "deadbeef") {
 		t.Errorf("request was re-signed despite no matching role; Authorization = %q", req.Header.Get("Authorization"))
 	}
 	if atomic.LoadInt32(calls) != 0 {
@@ -185,8 +185,14 @@ func TestAWSSSOCredentialNoSigV4Errors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	if err := c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{}); err == nil {
-		t.Fatal("expected an error when the request carries no SigV4 access-key-id")
+	// No Authorization header set, so there's nothing to re-sign on.
+	err = c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "no SigV4 access-key-id") {
+		t.Fatalf("err = %v, want one mentioning the missing SigV4 access-key-id", err)
+	}
+	// The request must be left untouched (no auth header invented).
+	if req.Header.Get("Authorization") != "" {
+		t.Errorf("Authorization = %q, want it left unset", req.Header.Get("Authorization"))
 	}
 }
 

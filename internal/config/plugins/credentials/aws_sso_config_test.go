@@ -248,6 +248,7 @@ profile "default" { credentials = [aws_sso_credential.sso] }
 	emitted := string(emittedBytes)
 	for _, want := range []string{
 		`start_url`, `"https://acme.awsapps.com/start"`,
+		`region`, `"us-east-1"`,
 		`role {`, `account_id`, `"111111111111"`,
 		`role_name`, `"Admin"`, `placeholder`, `"AKIAPROD0ADMIN000000"`,
 	} {
