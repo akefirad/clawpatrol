@@ -329,6 +329,15 @@ func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Reques
 	// understands; reSignProxiedRequest derives service/region from the
 	// request and reuses/recomputes the payload hash. It uses no
 	// AWSCredential receiver state, so a zero-value receiver is fine.
+	//
+	// BODY-CONTENT POLICY CAVEAT (akefirad/clawpatrol#21, pre-existing in
+	// reSignProxiedRequest): the re-signer trusts the agent's
+	// X-Amz-Content-Sha256. For UNSIGNED-PAYLOAD (S3 doesn't hash-check) or a
+	// body over DefaultBodyBufferLimit, the body AWS ingests can differ from
+	// what the rules engine saw — so a body-content rule on an AWS endpoint is
+	// advisory for those requests, now under an SSO-minted role too. Method/
+	// header/path rules (the shipped examples) are unaffected. Real fix edits
+	// aws.go; deferred (#21).
 	roleSec := runtime.Secret{Extras: map[string]string{
 		"access_key_id":     creds.AccessKeyID,
 		"secret_access_key": creds.SecretAccessKey,

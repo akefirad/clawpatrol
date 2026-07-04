@@ -35,7 +35,15 @@
 # SPECIFIC service (e.g. S3) give it its own endpoint (host-matched) and
 # attach rules there. JSON-protocol services (DynamoDB, ...) put the IAM
 # action in the X-Amz-Target header as "<Service>.<Action>", so they can be
-# gated by header instead.
+# gated by header instead. Prefer method / header / path rules (as below):
+# they're authoritative.
+#
+# BODY-CONTENT RULES ARE ADVISORY (akefirad/clawpatrol#21, pre-existing): the
+# re-signer trusts the agent's X-Amz-Content-Sha256, so for UNSIGNED-PAYLOAD
+# (S3 doesn't hash-check the body) or a body over the buffer limit, the body
+# AWS ingests can differ from what the rules engine inspected. Don't rely on a
+# CEL rule matching request-body content as a hard security boundary; gate by
+# method/header/path (or deny UNSIGNED-PAYLOAD) instead.
 #
 # !!! POLICY CAVEAT — ROLE SELECTION IS INVISIBLE TO THE RULES ENGINE !!!
 # The rules see method/path/query/headers/body, NOT the matched (account,
