@@ -156,6 +156,25 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 			writeJSON(rw, map[string]string{"error": "slow_down"})
 			return
 		}
+		// Everything below is terminal (the dashboard stops polling on any
+		// non-pending error). Delete the dead session now rather than letting
+		// it linger until the 10-minute GC.
+		w.mu.Lock()
+		delete(w.sessions, sess.state)
+		w.mu.Unlock()
+		// Map the known terminal ssooidc errors to the RFC-8628 codes the
+		// dashboard expects, mirroring the pending/slow_down handling above:
+		// the device code expired, or the user clicked "deny".
+		var expired *ssooidctypes.ExpiredTokenException
+		if errors.As(err, &expired) {
+			writeJSON(rw, map[string]string{"error": "expired_token"})
+			return
+		}
+		var denied *ssooidctypes.AccessDeniedException
+		if errors.As(err, &denied) {
+			writeJSON(rw, map[string]string{"error": "access_denied"})
+			return
+		}
 		writeJSON(rw, map[string]any{"error": "create_token", "detail": err.Error()})
 		return
 	}

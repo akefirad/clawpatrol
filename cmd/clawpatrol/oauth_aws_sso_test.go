@@ -172,3 +172,44 @@ func TestPollAWSSSODeviceFlowPending(t *testing.T) {
 		t.Error("session deleted on a pending poll; polling can no longer continue")
 	}
 }
+
+// TestPollAWSSSODeviceFlowTerminalErrors verifies the known terminal ssooidc
+// errors are mapped to the RFC-8628 codes the dashboard expects (not a raw
+// AWS exception string), and that the dead session is deleted so it doesn't
+// linger until GC.
+func TestPollAWSSSODeviceFlowTerminalErrors(t *testing.T) {
+	cases := []struct {
+		name, errType, wantCode string
+	}{
+		{"device code expired", "ExpiredTokenException", "expired_token"},
+		{"user denied", "AccessDeniedException", "access_denied"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			awsSSOMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-Amzn-Errortype", tc.errType)
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"__type":"` + tc.errType + `","message":"terminal"}`))
+			})
+			w, reg := newAWSSSOTestMux()
+			w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: "cid|csec|dc|us-east-1"}
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/api/oauth/device-poll?state=st", nil)
+			w.pollAWSSSODeviceFlow(rec, req, w.sessions["st"])
+
+			var out map[string]any
+			_ = json.Unmarshal(rec.Body.Bytes(), &out)
+			if out["error"] != tc.wantCode {
+				t.Errorf("response = %v, want error=%s", out, tc.wantCode)
+			}
+			if connected, _ := reg.Status("sso"); connected {
+				t.Error("registry shows connected on a terminal error — must not persist")
+			}
+			// The dead session must be deleted, not left for the GC.
+			if _, ok := w.sessions["st"]; ok {
+				t.Error("session not deleted on a terminal error")
+			}
+		})
+	}
+}
