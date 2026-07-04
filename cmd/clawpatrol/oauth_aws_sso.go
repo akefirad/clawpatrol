@@ -86,7 +86,10 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 		ClientType: aws.String("public"),
 	})
 	if err != nil {
-		http.Error(rw, "aws_sso register client: "+err.Error(), http.StatusBadGateway)
+		// Log the raw aws-sdk detail server-side; return a generic message to
+		// the browser (matches the codebase's don't-surface-raw-detail rule).
+		log.Printf("aws_sso register client: %v", err)
+		http.Error(rw, "aws_sso: register client failed", http.StatusBadGateway)
 		return
 	}
 	da, err := client.StartDeviceAuthorization(ctx, &ssooidc.StartDeviceAuthorizationInput{
@@ -95,7 +98,8 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 		StartUrl:     aws.String(startURL),
 	})
 	if err != nil {
-		http.Error(rw, "aws_sso start device authorization: "+err.Error(), http.StatusBadGateway)
+		log.Printf("aws_sso start device authorization: %v", err)
+		http.Error(rw, "aws_sso: start device authorization failed", http.StatusBadGateway)
 		return
 	}
 
@@ -204,7 +208,10 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 			writeJSON(rw, map[string]string{"error": "access_denied"})
 			return
 		}
-		writeJSON(rw, map[string]any{"error": "create_token", "detail": err.Error()})
+		// Unknown terminal error: log the raw aws-sdk detail server-side, return
+		// a generic code to the browser (no raw operation/RequestID/endpoint).
+		log.Printf("aws_sso poll: CreateToken failed: %v", err)
+		writeJSON(rw, map[string]string{"error": "create_token"})
 		return
 	}
 	if aws.ToString(out.AccessToken) == "" {
@@ -233,7 +240,12 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 	delete(w.sessions, sess.state)
 	w.mu.Unlock()
 	if err := w.g.oauth.Set(r.Context(), sess.id, tok); err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		// The device code is already consumed, so a successfully-minted SSO
+		// token is being lost here — log it (this is the only server-side
+		// trace) and return a generic message rather than echoing the raw
+		// (possibly DB-driver) error to the browser.
+		log.Printf("aws_sso poll: persist token for %q failed: %v", sess.id, err)
+		http.Error(rw, "aws_sso: failed to persist token", http.StatusInternalServerError)
 		return
 	}
 	writeJSON(rw, map[string]any{"connected": true, "expires": tok.Expiry.Unix()})
