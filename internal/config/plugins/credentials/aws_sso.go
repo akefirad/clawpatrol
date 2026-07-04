@@ -241,9 +241,19 @@ func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Reques
 	}
 	role := c.roleForPlaceholder(akid)
 	if role == nil {
-		// Unknown placeholder → no role. Fail closed rather than
-		// re-signing under an unintended identity. (Multi-role dispatch
-		// and the explicit no-profile-deny semantics land in a later slice.)
+		// Unknown placeholder → no role, so we do NOT re-sign under an
+		// unintended identity. Returning an error here is only "fail closed"
+		// at the credential: the gateway's signer path (main.go) logs a sign
+		// error and still forwards the request upstream bearing the agent's
+		// placeholder signature, which AWS then rejects (InvalidClientTokenId).
+		// So the request is effectively denied, but by AWS, not the gateway.
+		//
+		// IMPROVEMENT (akefirad/clawpatrol#16): prefer a true gateway-level
+		// rejection (a 4xx/502, like the transform-credential fail-closed
+		// branch in main.go) so an unknown placeholder never egresses at all.
+		// That means teaching the signer path to fail closed on error, which
+		// changes behavior for all signers (aws_credential included) —
+		// deferred to keep this additive.
 		return fmt.Errorf("aws_sso_credential: no role mapping for placeholder access-key-id %q", akid)
 	}
 	ssoToken := string(sec.Bytes)

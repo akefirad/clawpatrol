@@ -6,8 +6,11 @@
 # a distinct PLACEHOLDER access-key-id (seeded into the agent's
 # ~/.aws/credentials); the gateway maps that placeholder to the role's
 # real, short-lived credentials (minted + cached via sso:GetRoleCredentials)
-# and re-signs the request. The agent never holds real credentials, and a
-# call with no matching placeholder is denied.
+# and re-signs the request. The agent never holds real credentials. A call
+# with no matching placeholder is NOT re-signed by the gateway: it forwards
+# upstream still carrying the agent's placeholder signature, which AWS
+# rejects (InvalidClientTokenId) — so it's effectively denied, but by AWS,
+# not by a gateway-level block.
 #
 # POLICY is stock http-facet rules on the reused `https` endpoint(s) — no
 # AWS-specific policy engine. The http facet exposes no host, so to gate a
