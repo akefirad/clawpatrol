@@ -348,6 +348,13 @@ func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Reques
 		// surfaces as "aws_credential: …" (and main.go logs "sign <name>:
 		// aws_credential: …"), which an operator grepping for aws_sso_credential
 		// would miss.
+		//
+		// NOTE: unlike the early returns above (which leave the agent's
+		// placeholder signature intact for AWS to reject), reSignProxiedRequest
+		// strips Authorization + X-Amz-Security-Token BEFORE v4.SignHTTP, so on
+		// a re-sign failure main.go's fail-open forwards a request with NO auth
+		// header (still rejected by AWS — no unintended-identity egress). The
+		// true gateway-level fail-closed (#16) would make this moot.
 		return fmt.Errorf("aws_sso_credential: re-sign: %w", err)
 	}
 	return nil
