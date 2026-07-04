@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -230,6 +231,123 @@ func TestAWSSSOCredentialZeroExpirationErrors(t *testing.T) {
 	err := c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{})
 	if err == nil || !strings.Contains(err.Error(), "no expiration") {
 		t.Fatalf("err = %v, want one mentioning the missing expiration", err)
+	}
+}
+
+// mockSSOWith stands up a fake GetRoleCredentials endpoint with a chosen
+// expiry (so the expiry-window path can be exercised) or a forced failure,
+// records the call count, and captures the last SSO bearer token the SDK
+// sent (the x-amz-sso_bearer_token header) so a test can assert the token
+// from sec.Bytes actually authorizes the mint.
+func mockSSOWith(t *testing.T, expiry time.Time, fail bool) (calls *int32, lastBearer func() string) {
+	t.Helper()
+	var n int32
+	var mu sync.Mutex
+	var bearer string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&n, 1)
+		mu.Lock()
+		bearer = r.Header.Get("X-Amz-Sso_bearer_token")
+		mu.Unlock()
+		if fail {
+			w.Header().Set("X-Amzn-Errortype", "InvalidRequestException")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"__type":"InvalidRequestException","message":"boom"}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"roleCredentials": map[string]any{
+				"accessKeyId":     "AKIDEXAMPLE",
+				"secretAccessKey": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+				"sessionToken":    "FwoGZXIvYXdzEXAMPLE",
+				"expiration":      expiry.UnixMilli(),
+			},
+		})
+	}))
+	prev := newSSOClient
+	newSSOClient = func(region string) *sso.Client {
+		return sso.New(sso.Options{Region: region, BaseEndpoint: aws.String(srv.URL), Credentials: aws.AnonymousCredentials{}})
+	}
+	t.Cleanup(func() { newSSOClient = prev; srv.Close() })
+	return &n, func() string { mu.Lock(); defer mu.Unlock(); return bearer }
+}
+
+// TestAWSSSOCredentialUsesBearerToken pins the core security contract: the
+// SSO token from sec.Bytes must be what authorizes GetRoleCredentials (the
+// x-amz-sso_bearer_token header), not some ambient/empty value.
+func TestAWSSSOCredentialUsesBearerToken(t *testing.T) {
+	_, bearer := mockSSOWith(t, time.Now().Add(time.Hour), false)
+	c := ssoCredFixture()
+	if err := c.SignHTTPRequest(context.Background(), signedReq(t, "AKIAPROD0ADMIN000000"), ssoTokenSecret(), struct{}{}); err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	if got := bearer(); got != "sso-access-token" {
+		t.Errorf("GetRoleCredentials bearer token = %q, want the SSO token from sec.Bytes", got)
+	}
+}
+
+// TestAWSSSOCredentialConcurrentSingleMint asserts a concurrent burst for the
+// same role mints exactly once (the aws.CredentialsCache single-flight). rt is
+// pre-allocated via the Build hook so no two goroutines race the lazy alloc.
+func TestAWSSSOCredentialConcurrentSingleMint(t *testing.T) {
+	calls, _ := mockSSOWith(t, time.Now().Add(time.Hour), false)
+	c := ssoCredFixture()
+	if _, d := buildAWSSSO(c, "sso", nil); d.HasErrors() {
+		t.Fatalf("build: %v", d)
+	}
+	const n = 24
+	var wg sync.WaitGroup
+	errs := make(chan error, n)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- c.SignHTTPRequest(context.Background(), signedReq(t, "AKIAPROD0ADMIN000000"), ssoTokenSecret(), struct{}{})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("concurrent sign: %v", err)
+		}
+	}
+	if got := atomic.LoadInt32(calls); got != 1 {
+		t.Errorf("GetRoleCredentials called %d times under a concurrent burst, want 1 (single-flight)", got)
+	}
+}
+
+// TestAWSSSOCredentialReMintsInsideExpiryWindow verifies creds whose true
+// expiry falls inside awsSSOExpiryWindow are treated as due-for-refresh, so a
+// second request re-mints rather than serving about-to-expire creds.
+func TestAWSSSOCredentialReMintsInsideExpiryWindow(t *testing.T) {
+	// Expiry 2m out; the 5m expiry window makes every Retrieve re-mint.
+	calls, _ := mockSSOWith(t, time.Now().Add(2*time.Minute), false)
+	c := ssoCredFixture()
+	for i := 0; i < 2; i++ {
+		if err := c.SignHTTPRequest(context.Background(), signedReq(t, "AKIAPROD0ADMIN000000"), ssoTokenSecret(), struct{}{}); err != nil {
+			t.Fatalf("sign %d: %v", i, err)
+		}
+	}
+	if got := atomic.LoadInt32(calls); got != 2 {
+		t.Errorf("GetRoleCredentials called %d times, want 2 (creds inside the expiry window must re-mint)", got)
+	}
+}
+
+// TestAWSSSOCredentialMintFailurePreservesRequest verifies that when
+// GetRoleCredentials fails, signing returns an error and the request keeps its
+// original (placeholder) Authorization header — nothing is re-signed.
+func TestAWSSSOCredentialMintFailurePreservesRequest(t *testing.T) {
+	mockSSOWith(t, time.Time{}, true)
+	c := ssoCredFixture()
+	req := signedReq(t, "AKIAPROD0ADMIN000000")
+	orig := req.Header.Get("Authorization")
+	if err := c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{}); err == nil {
+		t.Fatal("expected an error when GetRoleCredentials fails")
+	}
+	if req.Header.Get("Authorization") != orig {
+		t.Errorf("Authorization mutated on mint failure: %q, want the original placeholder header", req.Header.Get("Authorization"))
 	}
 }
 
