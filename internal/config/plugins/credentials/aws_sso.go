@@ -105,10 +105,11 @@ type AWSSSOCredential struct {
 	Roles []AWSSSORole `hcl:"role,block"`
 
 	// rt holds request-time cache state (SSO client + per-role credential
-	// caches + latest token). Pointer + lazy alloc so the config body
-	// carries no lock (never copy-locked) and hand-built instances in
-	// tests work without a Build step. Guarded by awsSSORuntimeMu for
-	// allocation; awsSSORuntime.mu guards its own contents.
+	// caches + latest token). A pointer so the config body carries no lock
+	// (never copy-locked). Allocated by the Build hook (buildAWSSSO) so it's
+	// non-nil at request time; runtimeState() lazily allocs only for
+	// hand-built test instances that skip Build. awsSSORuntime.mu guards its
+	// own contents.
 	rt *awsSSORuntime
 }
 
@@ -126,16 +127,31 @@ func (rt *awsSSORuntime) currentToken() string {
 	return rt.token
 }
 
-// awsSSORuntimeMu guards lazy allocation of AWSSSOCredential.rt only.
-var awsSSORuntimeMu sync.Mutex
-
 func (c *AWSSSOCredential) runtimeState() *awsSSORuntime {
-	awsSSORuntimeMu.Lock()
-	defer awsSSORuntimeMu.Unlock()
+	// Production credentials are initialized by buildAWSSSO (the Build hook),
+	// so rt is non-nil by request time and this is a plain field read — no
+	// process-global lock across instances. The nil branch only covers
+	// hand-built test instances that skip Build; those are constructed on a
+	// single goroutine, and any test exercising concurrency must initialize
+	// rt first (call buildAWSSSO / newRuntime) so no two goroutines race here.
 	if c.rt == nil {
-		c.rt = &awsSSORuntime{caches: map[string]*aws.CredentialsCache{}}
+		c.rt = newAWSSSORuntime()
 	}
 	return c.rt
+}
+
+func newAWSSSORuntime() *awsSSORuntime {
+	return &awsSSORuntime{caches: map[string]*aws.CredentialsCache{}}
+}
+
+// buildAWSSSO is the plugin Build hook: it eagerly allocates the request-time
+// runtime state so rt is never nil at request time. This is what lets
+// runtimeState() avoid a process-global allocation lock (see #6). Build
+// returns the same *AWSSSOCredential pointer the runtime stores as its Body.
+func buildAWSSSO(decoded any, _ string, _ *config.BuildCtx) (any, hcl.Diagnostics) {
+	c := decoded.(*AWSSSOCredential)
+	c.rt = newAWSSSORuntime()
+	return c, nil
 }
 
 // sigV4AccessKeyID extracts the access-key-id from a SigV4 Authorization
@@ -413,7 +429,7 @@ func init() {
 		New:      newer[AWSSSOCredential](),
 		Runtime:  (*AWSSSOCredential)(nil),
 		Validate: validateAWSSSO,
-		Build:    passthrough,
+		Build:    buildAWSSSO,
 		Emit: func(body any, _ string, hb *hclwrite.Body) {
 			c := body.(*AWSSSOCredential)
 			hb.SetAttributeValue("start_url", cty.StringVal(c.StartURL))
