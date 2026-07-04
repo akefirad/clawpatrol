@@ -111,13 +111,14 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 		created: time.Now(),
 		// Pack the fields pollAWSSSODeviceFlow needs (CreateToken has no
 		// session of its own) into verifier, mirroring openai_device.
+		// No cfg: pollAWSSSODeviceFlow reads everything from verifier and never
+		// dereferences sess.cfg (unlike openai_device, which does).
 		verifier: strings.Join([]string{
 			aws.ToString(reg.ClientId),
 			aws.ToString(reg.ClientSecret),
 			aws.ToString(da.DeviceCode),
 			region,
 		}, "|"),
-		cfg: &oauth2.Config{ClientID: aws.ToString(reg.ClientId)},
 	}
 	for k, s := range w.sessions {
 		if time.Since(s.created) > 10*time.Minute {
