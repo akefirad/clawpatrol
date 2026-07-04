@@ -9,10 +9,13 @@ package main
 // hold that branch's logic; the only edit to oauth.go itself is the
 // two-line dispatch in apiOAuthStart / apiOAuthDevicePoll.
 //
-// The resulting SSO access token (+ refresh token) is persisted through
-// the standard OAuthRegistry path, exactly like every other OAuth-flow
-// credential; a later slice reads it back to mint per-role credentials
-// via sso:GetRoleCredentials (akefirad/clawpatrol#4).
+// The resulting SSO access token is persisted through the standard
+// OAuthRegistry path, exactly like every other OAuth-flow credential (the
+// refresh token is deliberately dropped in this cut — see the oauth2.Token
+// construction below). The token is delivered as the credential secret to
+// whichever credential declares Flow:"aws_sso"; in this design that reader
+// is the external AWS SSO plugin (akefirad/clawpatrol-plugin-aws#1), not an
+// in-tree credential.
 
 import (
 	"context"
@@ -62,8 +65,9 @@ var newSSOOIDCClient = func(region string) *ssooidc.Client {
 // pollAWSSSODeviceFlow can complete the exchange.
 //
 // startURL + SSO region ride on the OAuth config (AuthURL = the access
-// portal start URL; DeviceURL carries the SSO region — see the credential's
-// OAuthFlow()), so no policy lookup is needed here.
+// portal start URL; DeviceURL carries the SSO region — set by the
+// integration declaring Flow:"aws_sso", i.e. the external plugin), so no
+// policy lookup is needed here.
 func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, id string, it *OAuthIntegration) {
 	startURL := it.OAuth.AuthURL
 	region := it.OAuth.DeviceURL
@@ -117,10 +121,16 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 		state:   state,
 		id:      id,
 		created: time.Now(),
+		// pollAWSSSODeviceFlow reads everything it needs from verifier and
+		// never dereferences sess.cfg. But sessions are looked up by state
+		// alone, so other endpoints (apiOAuthExchange → exchangeOAuthCode →
+		// sess.cfg.Endpoint.TokenURL) can reach this session and would panic
+		// on a nil cfg. Every other flow stashes a non-nil cfg; keep that
+		// invariant with a minimal one so the exchange path degrades to a
+		// failed HTTP call instead of a nil-pointer panic.
+		cfg: &oauth2.Config{ClientID: aws.ToString(reg.ClientId)},
 		// Pack the fields pollAWSSSODeviceFlow needs (CreateToken has no
 		// session of its own) into verifier, mirroring openai_device.
-		// No cfg: pollAWSSSODeviceFlow reads everything from verifier and never
-		// dereferences sess.cfg (unlike openai_device, which does).
 		verifier: strings.Join([]string{
 			aws.ToString(reg.ClientId),
 			aws.ToString(reg.ClientSecret),
@@ -236,7 +246,7 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 		AccessToken: aws.ToString(out.AccessToken),
 		TokenType:   aws.ToString(out.TokenType),
 		// Deliberately NOT persisting out.RefreshToken until real SSO-token
-		// refresh lands (see the DEFERRED note in aws_sso.go / #6). Nothing
+		// refresh lands (akefirad/clawpatrol#6). Nothing
 		// can redeem it yet: aws_sso has no setToken refresh branch, so its
 		// OAuthConfig.TokenURL is empty. If we stored the refresh token, the
 		// oauth2 layer would, on expiry, try to refresh against "" and fail
