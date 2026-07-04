@@ -3,14 +3,32 @@
 # One dashboard device login (the aws_sso_credential's "Connect" card)
 # fans out to many (account, role) mappings. The agent picks a role per
 # request with the standard AWS_PROFILE / --profile: each profile carries
-# a distinct PLACEHOLDER access-key-id (seeded into the agent's
-# ~/.aws/credentials); the gateway maps that placeholder to the role's
-# real, short-lived credentials (minted + cached via sso:GetRoleCredentials)
-# and re-signs the request. The agent never holds real credentials. A call
-# with no matching placeholder is NOT re-signed by the gateway: it forwards
-# upstream still carrying the agent's placeholder signature, which AWS
-# rejects (InvalidClientTokenId) — so it's effectively denied, but by AWS,
-# not by a gateway-level block.
+# a distinct PLACEHOLDER access-key-id; the gateway maps that placeholder to
+# the role's real, short-lived credentials (minted + cached via
+# sso:GetRoleCredentials) and re-signs the request. The agent never holds
+# real credentials. A call with no matching placeholder is NOT re-signed by
+# the gateway: it forwards upstream still carrying the agent's placeholder
+# signature, which AWS rejects (InvalidClientTokenId) — so it's effectively
+# denied, but by AWS, not by a gateway-level block.
+#
+# AGENT PROFILES ARE NOT WRITTEN BY CLAWPATROL. This credential does no env
+# pushdown; you must hand-author the agent's ~/.aws/credentials, one profile
+# per role, each with that role's placeholder as aws_access_key_id and a
+# throwaway 40-char secret (aws-cli needs 40 chars to sign LOCALLY; the
+# gateway discards it and re-signs). Example, matching the roles below:
+#
+#     # ~/.aws/credentials  (on the agent)
+#     [readonly]
+#     aws_access_key_id     = AKIACLAWPATROLRO0000
+#     aws_secret_access_key = clawpatrolPlaceholderSecretDoNotUse00000
+#     [admin]
+#     aws_access_key_id     = AKIACLAWPATROLADMIN0
+#     aws_secret_access_key = clawpatrolPlaceholderSecretDoNotUse00000
+#
+# The aws_access_key_id MUST equal the role's `placeholder` here. NOTE:
+# GitHub secret scanning flags the AKIA[0-9A-Z]{16} shape, so committing an
+# agent config with these placeholders may trip scanners (arguably a feature
+# — but expect the alert; the secret is a throwaway, not a real key).
 #
 # POLICY is stock http-facet rules on the reused `https` endpoint(s) — no
 # AWS-specific policy engine. The http facet exposes no host, so to gate a
