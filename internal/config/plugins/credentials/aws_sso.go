@@ -347,6 +347,13 @@ func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Reques
 // start URL, and DeviceURL carries the SSO region (the ssooidc endpoint is
 // derived from it). No client id/secret/token are set here — the device
 // flow registers a client dynamically and the registry owns the token.
+//
+// SEMANTIC REUSE (deliberate, akefirad/clawpatrol#17): DeviceURL normally
+// holds a URL; here it carries a bare region string. Safe ONLY because the
+// Flow=="aws_sso" dispatch never routes this through the generic
+// pollDeviceFlow (which would POST to the "region"). Cleanup — a dedicated
+// OAuthConfig.Region (or generic Extra) field — is deferred to avoid editing
+// the shared upstream OAuthConfig type in this additive PR (#17).
 func (c *AWSSSOCredential) OAuthFlow() *config.OAuthIntegration {
 	return &config.OAuthIntegration{
 		Type: "aws_sso",
