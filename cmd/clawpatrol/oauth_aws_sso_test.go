@@ -178,6 +178,44 @@ func TestStartAWSSSODeviceFlow(t *testing.T) {
 	}
 }
 
+// TestAWSSSOSessionSurvivesExchangePath guards the nil-cfg invariant: sessions
+// are looked up by state alone, so any authenticated client can POST an aws_sso
+// state to /api/oauth/exchange (instead of /device-poll). exchangeOAuthCode's
+// first act is sess.cfg.Endpoint.TokenURL, so a nil cfg would panic the handler.
+// The start step must stash a non-nil cfg; the exchange then degrades to a
+// failed HTTP call (400) rather than a crash.
+func TestAWSSSOSessionSurvivesExchangePath(t *testing.T) {
+	awsSSOMockServer(t, func(http.ResponseWriter, *http.Request) {})
+	w, _ := newAWSSSOTestMux()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/oauth/start?id=sso", nil)
+	it := &OAuthIntegration{ID: "sso", Flow: "aws_sso", OAuth: OAuthConfig{
+		AuthURL:   "https://acme.awsapps.com/start",
+		DeviceURL: "us-east-1",
+	}}
+	w.startAWSSSODeviceFlow(rec, req, "sso", it)
+
+	var out struct {
+		State string `json:"state"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode start: %v (%s)", err, rec.Body.String())
+	}
+	if sess := w.sessions[out.State]; sess == nil || sess.cfg == nil {
+		t.Fatalf("aws_sso session must stash a non-nil cfg to keep the exchange path from panicking; got %+v", sess)
+	}
+
+	// The exchange path must not panic (it recovers here as a plain 4xx/5xx).
+	exRec := httptest.NewRecorder()
+	body := `{"state":"` + out.State + `","code":"whatever"}`
+	exReq := httptest.NewRequest("POST", "/api/oauth/exchange", strings.NewReader(body))
+	w.apiOAuthExchange(exRec, exReq)
+	if exRec.Code == 200 {
+		t.Fatalf("exchange of an aws_sso state unexpectedly succeeded: %s", exRec.Body.String())
+	}
+}
+
 // TestStartAWSSSODeviceFlowMissingConfig asserts the start step fails with a
 // 500 when the credential's start_url / region didn't make it onto the OAuth
 // config, rather than calling ssooidc with empty inputs.
