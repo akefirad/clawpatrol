@@ -59,6 +59,12 @@ var placeholderShape = regexp.MustCompile(`^[A-Z0-9]{16,32}$`)
 // awsAccountIDShape is the AWS 12-digit account number.
 var awsAccountIDShape = regexp.MustCompile(`^[0-9]{12}$`)
 
+// awsRegionShape is a lenient AWS region token (lowercase, digits, hyphens).
+// region is operator-authored HCL and the SDK anchors it inside .amazonaws.com
+// (not agent-reachable), so this is legibility hardening, not an SSRF guard: a
+// bad value otherwise surfaces only as a confusing DNS error at request time.
+var awsRegionShape = regexp.MustCompile(`^[a-z0-9-]+$`)
+
 // awsSSOExpiryWindow refreshes cached role credentials this long before
 // their true expiry, so a request never signs with about-to-expire creds
 // and the refresh (a GetRoleCredentials call) happens ahead of expiry.
@@ -188,6 +194,10 @@ func sigV4AccessKeyID(authHeader string) string {
 // the given access-key-id, or nil when none matches.
 func (c *AWSSSOCredential) roleForPlaceholder(akid string) *AWSSSORole {
 	for i := range c.Roles {
+		// The != "" term is defensive: the caller returns early on empty akid
+		// and validation forbids empty placeholders, so it can't change the
+		// result today — it just guards against an empty==empty match if either
+		// invariant ever regresses.
 		if c.Roles[i].Placeholder != "" && c.Roles[i].Placeholder == akid {
 			return &c.Roles[i]
 		}
@@ -278,12 +288,12 @@ func (p *ssoRoleProvider) Retrieve(ctx context.Context) (aws.Credentials, error)
 	if rc == nil || aws.ToString(rc.AccessKeyId) == "" {
 		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: GetRoleCredentials(%s/%s) returned no credentials", p.accountID, p.roleName)
 	}
-	// A zero Expiration would become time.UnixMilli(0) = 1970, which with
-	// CanExpire:true makes aws.CredentialsCache treat the entry as already
-	// expired — so every request re-mints (latency + AWS throttling /
-	// TooManyRequestsException). AWS always populates it; treat a zero as an
-	// error rather than caching a permanently-expired entry.
-	if rc.Expiration == 0 {
+	// A zero (or negative) Expiration would become a 1970/pre-epoch time via
+	// time.UnixMilli, which with CanExpire:true makes aws.CredentialsCache treat
+	// the entry as already expired — so every request re-mints (latency + AWS
+	// throttling / TooManyRequestsException). AWS always populates it; treat
+	// non-positive as an error rather than caching a permanently-expired entry.
+	if rc.Expiration <= 0 {
 		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: GetRoleCredentials(%s/%s) returned no expiration", p.accountID, p.roleName)
 	}
 	return aws.Credentials{
@@ -430,6 +440,8 @@ func validateAWSSSO(decoded any, name string, _ *config.BuildCtx) hcl.Diagnostic
 	}
 	if c.Region == "" {
 		add("region is required (the SSO region)")
+	} else if !awsRegionShape.MatchString(c.Region) {
+		add(fmt.Sprintf("region %q is not a valid AWS region (lowercase letters, digits, hyphens)", c.Region))
 	}
 	if len(c.Roles) == 0 {
 		add("must declare at least one role mapping")
