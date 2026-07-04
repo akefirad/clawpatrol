@@ -18,8 +18,12 @@ package credentials
 // the dashboard device login that obtains it lives in the gateway's OAuth
 // engine (Flow="aws_sso"). Per-role temporary credentials are cached in
 // memory (aws.CredentialsCache: expiry-margin + single-flight refresh), so
-// a burst of requests triggers at most one GetRoleCredentials call and the
-// cache repopulates from the stored token after a restart. SSO-token
+// a burst of requests triggers at most one GetRoleCredentials call. The cache
+// lives on the credential body, so it's discarded and repopulated from the
+// stored token whenever a fresh body is built — not only a process restart but
+// any config reload / dashboard apply (New+Build run again). Churny config
+// pushes therefore re-mint; correctness is unaffected (the stored SSO token
+// still mints), it just forgoes caching across reloads. SSO-token
 // refresh for long sessions is a later slice (akefirad/clawpatrol#6);
 // multi-role switching + explicit no-profile-deny semantics land in #5.
 //
@@ -319,9 +323,17 @@ func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Reques
 		// deferred to keep this additive.
 		return fmt.Errorf("aws_sso_credential: no role mapping for placeholder access-key-id %q", akid)
 	}
+	// sec is whatever gatewaySecretStore.Get returned. It prefers a
+	// credential_secrets DB row over the OAuth bearer token, so if a row exists
+	// under this credential's name — e.g. a type change reusing the name
+	// (aws_credential "foo" → aws_sso_credential "foo"), dev_seed, or a direct
+	// write — sec.Bytes is that row's (empty) value and shadows the connected
+	// SSO token. aws_sso declares no SecretSlots, so this shouldn't happen via
+	// the dashboard, but the error names it so "connected but not signing" is
+	// diagnosable rather than mysterious.
 	ssoToken := string(sec.Bytes)
 	if ssoToken == "" {
-		return fmt.Errorf("aws_sso_credential: no SSO token available (connect AWS SSO in the dashboard)")
+		return fmt.Errorf("aws_sso_credential: no SSO token available — connect AWS SSO in the dashboard (or, if already connected, a credential_secrets row is shadowing the OAuth token under this credential name)")
 	}
 	creds, err := c.roleCreds(ctx, *role, ssoToken)
 	if err != nil {
