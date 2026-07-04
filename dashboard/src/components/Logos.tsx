@@ -78,7 +78,7 @@ export function IntegrationIcon({
     return <BrandIcon name="googlegemini" color="%238e75b2" className={className} />;
   if (t === "notion_oauth" || t === "notion_mcp_oauth")
     return <BrandIcon name="notion" className={className} />;
-  if (t === "aws_credential")
+  if (t === "aws_credential" || t === "aws_sso_credential")
     return <BrandIcon name="amazoneks" color="%23ff9900" className={className} />;
   if (t === "mtls_credential") return <KeyGlyph className={className} />;
   return <KeyGlyph className={className} />;
