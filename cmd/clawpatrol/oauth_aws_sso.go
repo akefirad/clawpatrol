@@ -102,6 +102,14 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 		http.Error(rw, "aws_sso: start device authorization failed", http.StatusBadGateway)
 		return
 	}
+	// Defensive (mirrors startOpenAIDeviceFlow rejecting empty fields): a 200
+	// with an empty user/device code would otherwise render a blank Connect
+	// card and make every poll fail opaquely. AWS populates these on success.
+	if aws.ToString(da.UserCode) == "" || aws.ToString(da.DeviceCode) == "" {
+		log.Printf("aws_sso start device authorization: empty user/device code in response")
+		http.Error(rw, "aws_sso: empty device authorization response", http.StatusBadGateway)
+		return
+	}
 
 	state := randomString(32)
 	w.mu.Lock()
@@ -216,6 +224,10 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 		return
 	}
 	if aws.ToString(out.AccessToken) == "" {
+		// A success (err==nil) with no access token is an upstream anomaly, not
+		// a real pending state — treat as pending (avoid persisting an empty
+		// token) but log it, so it doesn't silently spin until code expiry.
+		log.Printf("aws_sso poll: CreateToken succeeded with an empty access token (treating as pending)")
 		writeJSON(rw, map[string]string{"error": "authorization_pending"})
 		return
 	}
@@ -249,5 +261,12 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 		http.Error(rw, "aws_sso: failed to persist token", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(rw, map[string]any{"connected": true, "expires": tok.Expiry.Unix()})
+	resp := map[string]any{"connected": true}
+	// Only report an expiry when there's a real one — a zero tok.Expiry would
+	// otherwise serialize as a year-1 epoch. (AWS always returns ExpiresIn; the
+	// dashboard reads expires_at from the status endpoint regardless.)
+	if !tok.Expiry.IsZero() {
+		resp["expires"] = tok.Expiry.Unix()
+	}
+	writeJSON(rw, resp)
 }
