@@ -128,12 +128,14 @@ func (rt *awsSSORuntime) currentToken() string {
 }
 
 func (c *AWSSSOCredential) runtimeState() *awsSSORuntime {
-	// Production credentials are initialized by buildAWSSSO (the Build hook),
-	// so rt is non-nil by request time and this is a plain field read — no
-	// process-global lock across instances. The nil branch only covers
-	// hand-built test instances that skip Build; those are constructed on a
-	// single goroutine, and any test exercising concurrency must initialize
-	// rt first (call buildAWSSSO / newRuntime) so no two goroutines race here.
+	// Framework-created credentials get rt at construction (the New hook), so
+	// rt is non-nil before any request goroutine and this is a plain field
+	// read — no process-global lock, and the safety is structural, not a
+	// comment-only invariant. The nil branch only covers hand-built test
+	// instances (a bare &AWSSSOCredential{} literal, which bypasses New); those
+	// are constructed on a single goroutine, and any test exercising
+	// concurrency must initialize rt first (call newAWSSSORuntime / buildAWSSSO)
+	// so no two goroutines race this write.
 	if c.rt == nil {
 		c.rt = newAWSSSORuntime()
 	}
@@ -456,9 +458,13 @@ func init() {
 	var _ runtime.HTTPRequestSigner = (*AWSSSOCredential)(nil)
 	var _ config.OAuthFlowProvider = (*AWSSSOCredential)(nil)
 	config.Register(&config.Plugin{
-		Kind:     config.KindCredential,
-		Type:     "aws_sso_credential",
-		New:      newer[AWSSSOCredential](),
+		Kind: config.KindCredential,
+		Type: "aws_sso_credential",
+		// Allocate rt at construction so every framework-created instance has
+		// non-nil runtime state before decode/Build/any request goroutine — the
+		// concurrency-safety of runtimeState() is then structural, not a
+		// comment-only invariant (buildAWSSSO re-inits once at load as a belt).
+		New:      func() any { return &AWSSSOCredential{rt: newAWSSSORuntime()} },
 		Runtime:  (*AWSSSOCredential)(nil),
 		Validate: validateAWSSSO,
 		Build:    buildAWSSSO,
