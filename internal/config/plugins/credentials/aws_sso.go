@@ -30,6 +30,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,16 @@ import (
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
+
+// placeholderShape accepts an AKID-ish token: uppercase letters + digits,
+// 16–32 chars. Kept permissive (not a strict 20-char AKIA-prefixed AKID)
+// since placeholders only need to be signable + distinct — but it rejects
+// the separators (/, comma, space) that would break the SigV4 Credential=
+// scope so sigV4AccessKeyID can't parse the routing key out of it.
+var placeholderShape = regexp.MustCompile(`^[A-Z0-9]{16,32}$`)
+
+// awsAccountIDShape is the AWS 12-digit account number.
+var awsAccountIDShape = regexp.MustCompile(`^[0-9]{12}$`)
 
 // awsSSOExpiryWindow refreshes cached role credentials this long before
 // their true expiry, so a request never signs with about-to-expire creds
@@ -358,8 +369,24 @@ func validateAWSSSO(decoded any, name string, _ *config.BuildCtx) hcl.Diagnostic
 		if r.AccountID == "" || r.RoleName == "" || r.Placeholder == "" {
 			add(fmt.Sprintf("role #%d: account_id, role_name, and placeholder are all required", i+1))
 		}
+		if r.AccountID != "" && !awsAccountIDShape.MatchString(r.AccountID) {
+			add(fmt.Sprintf("role #%d: account_id %q must be a 12-digit AWS account number", i+1, r.AccountID))
+		}
 		if r.Placeholder == "" {
 			continue
+		}
+		// A placeholder that can't survive SigV4 signing never routes: aws-cli
+		// signs with it, but the resulting Credential= scope no longer splits
+		// into 5 parts, sigV4AccessKeyID returns "", and every request fails
+		// with the unhelpful "carries no SigV4 access-key-id". Catch it here.
+		if !placeholderShape.MatchString(r.Placeholder) {
+			add(fmt.Sprintf("role #%d: placeholder %q must look like an access-key-id (16–32 uppercase letters/digits, no separators) so it survives SigV4 signing and stays routable", i+1, r.Placeholder))
+		}
+		// Reject the ambient placeholder aws_credential pushes into the agent
+		// env (AWS_ACCESS_KEY_ID=phAWSKeyID). Reusing it here cross-wires the
+		// two credential types when both are configured on the same gateway.
+		if r.Placeholder == phAWSKeyID {
+			add(fmt.Sprintf("role #%d: placeholder %q collides with aws_credential's ambient placeholder — pick a distinct access-key-id", i+1, r.Placeholder))
 		}
 		if seen[r.Placeholder] {
 			add(fmt.Sprintf("duplicate placeholder %q — each role needs a distinct placeholder access-key-id so requests route unambiguously", r.Placeholder))
