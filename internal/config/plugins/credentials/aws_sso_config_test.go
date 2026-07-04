@@ -155,6 +155,48 @@ endpoint "https" "aws" { hosts = ["*.amazonaws.com"] }
 }`,
 			wantErr: "required",
 		},
+		{
+			name: "unroutable placeholder (has separators)",
+			cred: `credential "aws_sso_credential" "sso" {
+  start_url = "https://acme.awsapps.com/start"
+  region    = "us-east-1"
+  endpoint  = https.aws
+  role {
+    account_id  = "111111111111"
+    role_name   = "Admin"
+    placeholder = "AKIA/BAD,PLACE HOLDER"
+  }
+}`,
+			wantErr: "survives SigV4 signing",
+		},
+		{
+			name: "placeholder collides with ambient aws_credential placeholder",
+			cred: `credential "aws_sso_credential" "sso" {
+  start_url = "https://acme.awsapps.com/start"
+  region    = "us-east-1"
+  endpoint  = https.aws
+  role {
+    account_id  = "111111111111"
+    role_name   = "Admin"
+    placeholder = "AKIACLAWPATROLPLACE0"
+  }
+}`,
+			wantErr: "ambient placeholder",
+		},
+		{
+			name: "account_id not 12 digits",
+			cred: `credential "aws_sso_credential" "sso" {
+  start_url = "https://acme.awsapps.com/start"
+  region    = "us-east-1"
+  endpoint  = https.aws
+  role {
+    account_id  = "12345"
+    role_name   = "Admin"
+    placeholder = "AKIAPROD0ADMIN000000"
+  }
+}`,
+			wantErr: "12-digit AWS account number",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

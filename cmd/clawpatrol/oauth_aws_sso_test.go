@@ -108,6 +108,31 @@ func TestStartAWSSSODeviceFlow(t *testing.T) {
 	}
 }
 
+// TestStartAWSSSODeviceFlowMissingConfig asserts the start step fails with a
+// 500 when the credential's start_url / region didn't make it onto the OAuth
+// config, rather than calling ssooidc with empty inputs.
+func TestStartAWSSSODeviceFlowMissingConfig(t *testing.T) {
+	cases := []struct {
+		name            string
+		authURL, devURL string
+	}{
+		{"missing start_url", "", "us-east-1"},
+		{"missing region", "https://acme.awsapps.com/start", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w, _ := newAWSSSOTestMux()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/api/oauth/start?id=sso", nil)
+			it := &OAuthIntegration{ID: "sso", Flow: "aws_sso", OAuth: OAuthConfig{AuthURL: tc.authURL, DeviceURL: tc.devURL}}
+			w.startAWSSSODeviceFlow(rec, req, "sso", it)
+			if rec.Code != http.StatusInternalServerError {
+				t.Errorf("status = %d, want 500 for %s", rec.Code, tc.name)
+			}
+		})
+	}
+}
+
 // TestPollAWSSSODeviceFlowSuccess exchanges the device code for a token and
 // asserts it is persisted through the registry (dashboard sees connected).
 func TestPollAWSSSODeviceFlowSuccess(t *testing.T) {
@@ -170,5 +195,46 @@ func TestPollAWSSSODeviceFlowPending(t *testing.T) {
 	// The session must survive so the dashboard can keep polling.
 	if _, ok := w.sessions["st"]; !ok {
 		t.Error("session deleted on a pending poll; polling can no longer continue")
+	}
+}
+
+// TestPollAWSSSODeviceFlowTerminalErrors verifies the known terminal ssooidc
+// errors are mapped to the RFC-8628 codes the dashboard expects (not a raw
+// AWS exception string), and that the dead session is deleted so it doesn't
+// linger until GC.
+func TestPollAWSSSODeviceFlowTerminalErrors(t *testing.T) {
+	cases := []struct {
+		name, errType, wantCode string
+	}{
+		{"device code expired", "ExpiredTokenException", "expired_token"},
+		{"user denied", "AccessDeniedException", "access_denied"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			awsSSOMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("X-Amzn-Errortype", tc.errType)
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"__type":"` + tc.errType + `","message":"terminal"}`))
+			})
+			w, reg := newAWSSSOTestMux()
+			w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: "cid|csec|dc|us-east-1"}
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest("POST", "/api/oauth/device-poll?state=st", nil)
+			w.pollAWSSSODeviceFlow(rec, req, w.sessions["st"])
+
+			var out map[string]any
+			_ = json.Unmarshal(rec.Body.Bytes(), &out)
+			if out["error"] != tc.wantCode {
+				t.Errorf("response = %v, want error=%s", out, tc.wantCode)
+			}
+			if connected, _ := reg.Status("sso"); connected {
+				t.Error("registry shows connected on a terminal error — must not persist")
+			}
+			// The dead session must be deleted, not left for the GC.
+			if _, ok := w.sessions["st"]; ok {
+				t.Error("session not deleted on a terminal error")
+			}
+		})
 	}
 }

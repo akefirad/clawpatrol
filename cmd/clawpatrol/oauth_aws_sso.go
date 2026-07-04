@@ -55,6 +55,12 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 	defer cancel()
 
 	client := newSSOOIDCClient(region)
+	// NOTE (akefirad/clawpatrol#6): every Connect registers a fresh OIDC
+	// client. Registrations are valid ~90 days and the AWS CLI caches them
+	// for exactly this reason; re-registering each time is wasteful but
+	// harmless. Caching the registration (client id + secret + expiry, e.g.
+	// in the blob store) is deferred INTO the refresh work: refresh needs the
+	// persisted client_secret anyway, so both are solved together in #6.
 	reg, err := client.RegisterClient(ctx, &ssooidc.RegisterClientInput{
 		ClientName: aws.String("clawpatrol"),
 		ClientType: aws.String("public"),
@@ -150,6 +156,25 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 			writeJSON(rw, map[string]string{"error": "slow_down"})
 			return
 		}
+		// Everything below is terminal (the dashboard stops polling on any
+		// non-pending error). Delete the dead session now rather than letting
+		// it linger until the 10-minute GC.
+		w.mu.Lock()
+		delete(w.sessions, sess.state)
+		w.mu.Unlock()
+		// Map the known terminal ssooidc errors to the RFC-8628 codes the
+		// dashboard expects, mirroring the pending/slow_down handling above:
+		// the device code expired, or the user clicked "deny".
+		var expired *ssooidctypes.ExpiredTokenException
+		if errors.As(err, &expired) {
+			writeJSON(rw, map[string]string{"error": "expired_token"})
+			return
+		}
+		var denied *ssooidctypes.AccessDeniedException
+		if errors.As(err, &denied) {
+			writeJSON(rw, map[string]string{"error": "access_denied"})
+			return
+		}
 		writeJSON(rw, map[string]any{"error": "create_token", "detail": err.Error()})
 		return
 	}
@@ -159,9 +184,17 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 	}
 
 	tok := &oauth2.Token{
-		AccessToken:  aws.ToString(out.AccessToken),
-		RefreshToken: aws.ToString(out.RefreshToken),
-		TokenType:    aws.ToString(out.TokenType),
+		AccessToken: aws.ToString(out.AccessToken),
+		TokenType:   aws.ToString(out.TokenType),
+		// Deliberately NOT persisting out.RefreshToken until real SSO-token
+		// refresh lands (see the DEFERRED note in aws_sso.go / #6). Nothing
+		// can redeem it yet: aws_sso has no setToken refresh branch, so its
+		// OAuthConfig.TokenURL is empty. If we stored the refresh token, the
+		// oauth2 layer would, on expiry, try to refresh against "" and fail
+		// with a cryptic `unsupported protocol scheme ""`. Omitting it makes
+		// expiry surface as the clean `token expired and refresh token is not
+		// set` — a clear "reconnect AWS SSO" signal. Restore persistence
+		// together with the refresh branch when #6 lands.
 	}
 	if out.ExpiresIn > 0 {
 		tok.Expiry = time.Now().Add(time.Duration(out.ExpiresIn) * time.Second)

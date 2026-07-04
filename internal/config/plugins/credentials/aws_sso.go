@@ -30,6 +30,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -43,6 +44,16 @@ import (
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
+
+// placeholderShape accepts an AKID-ish token: uppercase letters + digits,
+// 16–32 chars. Kept permissive (not a strict 20-char AKIA-prefixed AKID)
+// since placeholders only need to be signable + distinct — but it rejects
+// the separators (/, comma, space) that would break the SigV4 Credential=
+// scope so sigV4AccessKeyID can't parse the routing key out of it.
+var placeholderShape = regexp.MustCompile(`^[A-Z0-9]{16,32}$`)
+
+// awsAccountIDShape is the AWS 12-digit account number.
+var awsAccountIDShape = regexp.MustCompile(`^[0-9]{12}$`)
 
 // awsSSOExpiryWindow refreshes cached role credentials this long before
 // their true expiry, so a request never signs with about-to-expire creds
@@ -69,6 +80,20 @@ type AWSSSORole struct {
 
 // AWSSSOCredential is the aws_sso_credential plugin body: one SSO
 // authentication plus a list of role mappings.
+//
+// POLICY CAVEAT: role selection is invisible to the rules engine. The http
+// facet exposes method/path/query/headers/body — not the matched
+// (account, role) — so every role on one credential shares ONE policy
+// surface: an endpoint's rules are effectively the UNION across all its
+// mapped roles. An agent that can pass the shared rules can mint the most
+// privileged configured role. To isolate a high-privilege role, put it on
+// its OWN aws_sso_credential bound to its OWN endpoint (host-matched), and
+// attach the stricter rules there.
+//
+// IMPROVEMENT: expose the matched (account, role) to policy — a CEL-visible
+// field or per-role endpoint bindings — so rules can discriminate per role
+// instead of per shared endpoint. Deferred: it touches the facet/policy
+// engine, not just this plugin.
 type AWSSSOCredential struct {
 	// StartURL is the AWS access portal URL of the IAM Identity Center
 	// instance (e.g. https://mycompany.awsapps.com/start).
@@ -80,10 +105,11 @@ type AWSSSOCredential struct {
 	Roles []AWSSSORole `hcl:"role,block"`
 
 	// rt holds request-time cache state (SSO client + per-role credential
-	// caches + latest token). Pointer + lazy alloc so the config body
-	// carries no lock (never copy-locked) and hand-built instances in
-	// tests work without a Build step. Guarded by awsSSORuntimeMu for
-	// allocation; awsSSORuntime.mu guards its own contents.
+	// caches + latest token). A pointer so the config body carries no lock
+	// (never copy-locked). Allocated by the Build hook (buildAWSSSO) so it's
+	// non-nil at request time; runtimeState() lazily allocs only for
+	// hand-built test instances that skip Build. awsSSORuntime.mu guards its
+	// own contents.
 	rt *awsSSORuntime
 }
 
@@ -101,23 +127,40 @@ func (rt *awsSSORuntime) currentToken() string {
 	return rt.token
 }
 
-// awsSSORuntimeMu guards lazy allocation of AWSSSOCredential.rt only.
-var awsSSORuntimeMu sync.Mutex
-
 func (c *AWSSSOCredential) runtimeState() *awsSSORuntime {
-	awsSSORuntimeMu.Lock()
-	defer awsSSORuntimeMu.Unlock()
+	// Production credentials are initialized by buildAWSSSO (the Build hook),
+	// so rt is non-nil by request time and this is a plain field read — no
+	// process-global lock across instances. The nil branch only covers
+	// hand-built test instances that skip Build; those are constructed on a
+	// single goroutine, and any test exercising concurrency must initialize
+	// rt first (call buildAWSSSO / newRuntime) so no two goroutines race here.
 	if c.rt == nil {
-		c.rt = &awsSSORuntime{caches: map[string]*aws.CredentialsCache{}}
+		c.rt = newAWSSSORuntime()
 	}
 	return c.rt
+}
+
+func newAWSSSORuntime() *awsSSORuntime {
+	return &awsSSORuntime{caches: map[string]*aws.CredentialsCache{}}
+}
+
+// buildAWSSSO is the plugin Build hook: it eagerly allocates the request-time
+// runtime state so rt is never nil at request time. This is what lets
+// runtimeState() avoid a process-global allocation lock (see #6). Build
+// returns the same *AWSSSOCredential pointer the runtime stores as its Body.
+func buildAWSSSO(decoded any, _ string, _ *config.BuildCtx) (any, hcl.Diagnostics) {
+	c := decoded.(*AWSSSOCredential)
+	c.rt = newAWSSSORuntime()
+	return c, nil
 }
 
 // sigV4AccessKeyID extracts the access-key-id from a SigV4 Authorization
 // header's `Credential=<AKID>/<date>/<region>/<service>/aws4_request`
 // element. Returns "" when the header is missing or malformed. (Sibling
 // of aws.go's parseSigV4CredentialScope, which returns service/region;
-// this returns the leading access-key-id we route on.)
+// this returns the leading access-key-id we route on. IMPROVEMENT: unify
+// the two into one parser returning (akid, service, region) — deferred to
+// akefirad/clawpatrol#18 since it edits aws.go, an existing upstream file.)
 func sigV4AccessKeyID(authHeader string) string {
 	const marker = "Credential="
 	i := strings.Index(authHeader, marker)
@@ -150,16 +193,26 @@ func (c *AWSSSOCredential) roleForPlaceholder(akid string) *AWSSSORole {
 // The per-ROLE temporary credentials are refreshed automatically here (the
 // aws.CredentialsCache re-mints them before expiry). The SSO ACCESS TOKEN
 // itself (ssoToken, delivered via the OAuthRegistry) is NOT refreshed: when
-// it expires (IAM Identity Center default ~8h) GetRoleCredentials starts
-// failing and the operator simply re-connects via the dashboard. That is a
-// graceful degradation, not a break.
+// it expires (IAM Identity Center default ~8h) the operator re-connects via
+// the dashboard.
 //
-// To add refresh later: register an awsSSORefreshSource for Flow=="aws_sso"
-// in the gateway's OAuth setToken switch (mirror anthropicRefreshSource),
-// calling ssooidc CreateToken(grant_type=refresh_token). The open question
-// is WHERE to persist the client secret it needs: the `credentials` table
-// has `client_id` + `refresh_token` but no `client_secret` column. Options
-// (to be decided): pack clientId+clientSecret into the existing client_id
+// What the operator actually sees on expiry: aws_sso has no setToken refresh
+// branch, and the device-flow poll deliberately does NOT persist a refresh
+// token (see oauth_aws_sso.go), so the OAuth layer surfaces the clean error
+// `token expired and refresh token is not set` rather than attempting a
+// refresh against an empty TokenURL (which would log a cryptic `unsupported
+// protocol scheme ""`). GetRoleCredentials is never reached — the token
+// lookup fails first; main.go logs `secret <name>: ... — forwarding without
+// injection` and the request forwards with the placeholder signature (AWS
+// then 403s). Graceful-ish degradation with a legible cause, not a break.
+//
+// To add refresh later: (1) persist the refresh token again in the poll,
+// and (2) register an awsSSORefreshSource for Flow=="aws_sso" in the
+// gateway's OAuth setToken switch (mirror anthropicRefreshSource), calling
+// ssooidc CreateToken(grant_type=refresh_token). The open question is WHERE
+// to persist the client secret it needs: the `credentials` table has
+// `client_id` + `refresh_token` but no `client_secret` column. Options (to
+// be decided): pack clientId+clientSecret into the existing client_id
 // column, add a client_secret column (schema migration), or use the blob
 // store. Parked pending that decision.
 
@@ -219,6 +272,14 @@ func (p *ssoRoleProvider) Retrieve(ctx context.Context) (aws.Credentials, error)
 	if rc == nil || aws.ToString(rc.AccessKeyId) == "" {
 		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: GetRoleCredentials(%s/%s) returned no credentials", p.accountID, p.roleName)
 	}
+	// A zero Expiration would become time.UnixMilli(0) = 1970, which with
+	// CanExpire:true makes aws.CredentialsCache treat the entry as already
+	// expired — so every request re-mints (latency + AWS throttling /
+	// TooManyRequestsException). AWS always populates it; treat a zero as an
+	// error rather than caching a permanently-expired entry.
+	if rc.Expiration == 0 {
+		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: GetRoleCredentials(%s/%s) returned no expiration", p.accountID, p.roleName)
+	}
 	return aws.Credentials{
 		AccessKeyID:     aws.ToString(rc.AccessKeyId),
 		SecretAccessKey: aws.ToString(rc.SecretAccessKey),
@@ -241,9 +302,19 @@ func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Reques
 	}
 	role := c.roleForPlaceholder(akid)
 	if role == nil {
-		// Unknown placeholder → no role. Fail closed rather than
-		// re-signing under an unintended identity. (Multi-role dispatch
-		// and the explicit no-profile-deny semantics land in a later slice.)
+		// Unknown placeholder → no role, so we do NOT re-sign under an
+		// unintended identity. Returning an error here is only "fail closed"
+		// at the credential: the gateway's signer path (main.go) logs a sign
+		// error and still forwards the request upstream bearing the agent's
+		// placeholder signature, which AWS then rejects (InvalidClientTokenId).
+		// So the request is effectively denied, but by AWS, not the gateway.
+		//
+		// IMPROVEMENT (akefirad/clawpatrol#16): prefer a true gateway-level
+		// rejection (a 4xx/502, like the transform-credential fail-closed
+		// branch in main.go) so an unknown placeholder never egresses at all.
+		// That means teaching the signer path to fail closed on error, which
+		// changes behavior for all signers (aws_credential included) —
+		// deferred to keep this additive.
 		return fmt.Errorf("aws_sso_credential: no role mapping for placeholder access-key-id %q", akid)
 	}
 	ssoToken := string(sec.Bytes)
@@ -278,6 +349,13 @@ func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Reques
 // start URL, and DeviceURL carries the SSO region (the ssooidc endpoint is
 // derived from it). No client id/secret/token are set here — the device
 // flow registers a client dynamically and the registry owns the token.
+//
+// SEMANTIC REUSE (deliberate, akefirad/clawpatrol#17): DeviceURL normally
+// holds a URL; here it carries a bare region string. Safe ONLY because the
+// Flow=="aws_sso" dispatch never routes this through the generic
+// pollDeviceFlow (which would POST to the "region"). Cleanup — a dedicated
+// OAuthConfig.Region (or generic Extra) field — is deferred to avoid editing
+// the shared upstream OAuthConfig type in this additive PR (#17).
 func (c *AWSSSOCredential) OAuthFlow() *config.OAuthIntegration {
 	return &config.OAuthIntegration{
 		Type: "aws_sso",
@@ -324,8 +402,24 @@ func validateAWSSSO(decoded any, name string, _ *config.BuildCtx) hcl.Diagnostic
 		if r.AccountID == "" || r.RoleName == "" || r.Placeholder == "" {
 			add(fmt.Sprintf("role #%d: account_id, role_name, and placeholder are all required", i+1))
 		}
+		if r.AccountID != "" && !awsAccountIDShape.MatchString(r.AccountID) {
+			add(fmt.Sprintf("role #%d: account_id %q must be a 12-digit AWS account number", i+1, r.AccountID))
+		}
 		if r.Placeholder == "" {
 			continue
+		}
+		// A placeholder that can't survive SigV4 signing never routes: aws-cli
+		// signs with it, but the resulting Credential= scope no longer splits
+		// into 5 parts, sigV4AccessKeyID returns "", and every request fails
+		// with the unhelpful "carries no SigV4 access-key-id". Catch it here.
+		if !placeholderShape.MatchString(r.Placeholder) {
+			add(fmt.Sprintf("role #%d: placeholder %q must look like an access-key-id (16–32 uppercase letters/digits, no separators) so it survives SigV4 signing and stays routable", i+1, r.Placeholder))
+		}
+		// Reject the ambient placeholder aws_credential pushes into the agent
+		// env (AWS_ACCESS_KEY_ID=phAWSKeyID). Reusing it here cross-wires the
+		// two credential types when both are configured on the same gateway.
+		if r.Placeholder == phAWSKeyID {
+			add(fmt.Sprintf("role #%d: placeholder %q collides with aws_credential's ambient placeholder — pick a distinct access-key-id", i+1, r.Placeholder))
 		}
 		if seen[r.Placeholder] {
 			add(fmt.Sprintf("duplicate placeholder %q — each role needs a distinct placeholder access-key-id so requests route unambiguously", r.Placeholder))
@@ -344,7 +438,7 @@ func init() {
 		New:      newer[AWSSSOCredential](),
 		Runtime:  (*AWSSSOCredential)(nil),
 		Validate: validateAWSSSO,
-		Build:    passthrough,
+		Build:    buildAWSSSO,
 		Emit: func(body any, _ string, hb *hclwrite.Body) {
 			c := body.(*AWSSSOCredential)
 			hb.SetAttributeValue("start_url", cty.StringVal(c.StartURL))

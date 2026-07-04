@@ -1371,8 +1371,9 @@ func (w *webMux) apiOAuthDevicePoll(rw http.ResponseWriter, r *http.Request) {
 	}
 	// Dispatch by integration's flow type. openai_device uses the
 	// codex deviceauth/token endpoint shape (JSON body, returns
-	// authorization_code + code_verifier instead of a token); the
-	// stdlib RFC-8628 path covers github.
+	// authorization_code + code_verifier instead of a token); aws_sso
+	// uses the ssooidc RegisterClient/CreateToken shape (see
+	// oauth_aws_sso.go); the stdlib RFC-8628 path covers github.
 	if it := w.g.oauth.Integration(sess.id); it != nil {
 		switch it.Flow {
 		case "openai_device":
