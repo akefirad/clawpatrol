@@ -158,7 +158,9 @@ func buildAWSSSO(decoded any, _ string, _ *config.BuildCtx) (any, hcl.Diagnostic
 // header's `Credential=<AKID>/<date>/<region>/<service>/aws4_request`
 // element. Returns "" when the header is missing or malformed. (Sibling
 // of aws.go's parseSigV4CredentialScope, which returns service/region;
-// this returns the leading access-key-id we route on.)
+// this returns the leading access-key-id we route on. IMPROVEMENT: unify
+// the two into one parser returning (akid, service, region) — deferred to
+// akefirad/clawpatrol#18 since it edits aws.go, an existing upstream file.)
 func sigV4AccessKeyID(authHeader string) string {
 	const marker = "Credential="
 	i := strings.Index(authHeader, marker)
