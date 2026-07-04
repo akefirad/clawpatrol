@@ -127,6 +127,11 @@ rule "s3-default-deny" {
 }
 
 # ── General AWS policy: reads allowed; a JSON-service write gate ──────
+# CAVEAT: this allows only REST-style reads (GET/HEAD). JSON-protocol services
+# (DynamoDB, and other X-Amz-Target APIs) issue reads as POST too — so a
+# DynamoDB GetItem/Query/Scan does NOT match aws-reads and falls through to
+# aws-default-deny. That's fail-closed (safe), but if you need those reads,
+# add an explicit allow rule keyed on the read actions in X-Amz-Target.
 rule "aws-reads" {
   endpoint  = https.aws
   condition = "http.method in ['GET', 'HEAD']"
