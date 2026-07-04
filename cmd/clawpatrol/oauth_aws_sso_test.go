@@ -9,7 +9,25 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
+
+	"github.com/denoland/clawpatrol/internal/config"
 )
+
+// fakeAWSSSOFlow is a minimal OAuthFlowProvider whose OAuthFlow() reports
+// Flow "aws_sso" — enough for apiOAuthStart's lookupOAuthFlow to resolve the
+// dispatch without importing the real credential type (a different package).
+type fakeAWSSSOFlow struct{}
+
+func (fakeAWSSSOFlow) OAuthFlow() *config.OAuthIntegration {
+	return &config.OAuthIntegration{
+		Type: "aws_sso",
+		Flow: "aws_sso",
+		OAuth: config.OAuthConfig{
+			AuthURL:   "https://acme.awsapps.com/start",
+			DeviceURL: "us-east-1",
+		},
+	}
+}
 
 // awsSSOMockServer stands up a fake ssooidc endpoint (the three REST-JSON
 // paths the device flow hits) and points newSSOOIDCClient at it for the
@@ -58,6 +76,58 @@ func newAWSSSOTestMux() (*webMux, *OAuthRegistry) {
 	}
 	w := &webMux{g: &Gateway{oauth: reg}, sessions: map[string]*oauthSession{}}
 	return w, reg
+}
+
+// TestOAuthDispatchReachesAWSSSOHandlers drives the shared apiOAuthStart /
+// apiOAuthDevicePoll entry points over HTTP (not the aws_sso handlers directly)
+// and asserts the Flow=="aws_sso" dispatch actually routes to the aws_sso
+// handlers — not the generic RFC-8628 pollDeviceFlow. A wrong flow string or a
+// dropped arm would leave the feature dead end-to-end while the direct-call
+// unit tests stayed green.
+func TestOAuthDispatchReachesAWSSSOHandlers(t *testing.T) {
+	awsSSOMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		// /token: report the user hasn't approved yet. Only pollAWSSSODeviceFlow
+		// maps AuthorizationPendingException → "authorization_pending"; the
+		// generic pollDeviceFlow would not produce this from a JSON ssooidc 400.
+		w.Header().Set("X-Amzn-Errortype", "AuthorizationPendingException")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"__type":"AuthorizationPendingException","message":"pending"}`))
+	})
+	w, _ := newAWSSSOTestMux()
+	// apiOAuthStart resolves the flow from the policy via lookupOAuthFlow.
+	w.g.policy.Store(&config.CompiledPolicy{
+		Credentials: map[string]*config.Entity{"sso": {Body: fakeAWSSSOFlow{}}},
+	})
+
+	// Start: must reach startAWSSSODeviceFlow (device payload with a user code).
+	startRec := httptest.NewRecorder()
+	startReq := httptest.NewRequest("POST", "/api/oauth/start?id=sso", nil)
+	w.apiOAuthStart(startRec, startReq)
+	if startRec.Code != 200 {
+		t.Fatalf("apiOAuthStart status = %d, body = %s", startRec.Code, startRec.Body.String())
+	}
+	var start struct {
+		Flow     string `json:"flow"`
+		State    string `json:"state"`
+		UserCode string `json:"user_code"`
+	}
+	if err := json.Unmarshal(startRec.Body.Bytes(), &start); err != nil {
+		t.Fatalf("decode start: %v (%s)", err, startRec.Body.String())
+	}
+	if start.UserCode != "UC-1234" {
+		t.Fatalf("user_code = %q — apiOAuthStart did not dispatch to startAWSSSODeviceFlow", start.UserCode)
+	}
+
+	// Poll: apiOAuthDevicePoll resolves the flow from the registry (sess.id) and
+	// must reach pollAWSSSODeviceFlow — proven by the aws_sso-specific mapping.
+	pollRec := httptest.NewRecorder()
+	pollReq := httptest.NewRequest("POST", "/api/oauth/device-poll?state="+start.State, nil)
+	w.apiOAuthDevicePoll(pollRec, pollReq)
+	var poll map[string]any
+	_ = json.Unmarshal(pollRec.Body.Bytes(), &poll)
+	if poll["error"] != "authorization_pending" {
+		t.Fatalf("device-poll response = %v — did not dispatch to pollAWSSSODeviceFlow", poll)
+	}
 }
 
 // TestStartAWSSSODeviceFlow drives RegisterClient + StartDeviceAuthorization
@@ -162,6 +232,23 @@ func TestPollAWSSSODeviceFlowSuccess(t *testing.T) {
 	if connected, _ := reg.Status("sso"); !connected {
 		t.Error("registry Status(sso) not connected — token was not persisted")
 	}
+	// The refresh token the mock returned MUST NOT have been persisted:
+	// aws_sso has no refresh branch and an empty TokenURL, so a stored refresh
+	// token would produce the cryptic `unsupported protocol scheme ""` on
+	// expiry. Read the persisted token back and assert it's empty — this pins
+	// the most safety-relevant intentional behavior in the flow so a future
+	// "helpful" edit that persists it fails the suite.
+	st := reg.get("sso")
+	if st == nil {
+		t.Fatal("no oauth state persisted for sso")
+	}
+	got, err := st.source.Token()
+	if err != nil {
+		t.Fatalf("read back persisted token: %v", err)
+	}
+	if got.RefreshToken != "" {
+		t.Errorf("persisted refresh_token = %q, want empty (aws_sso must drop it until refresh lands)", got.RefreshToken)
+	}
 	// Session must be consumed on success.
 	if _, ok := w.sessions["st"]; ok {
 		t.Error("session not deleted after successful token exchange")
@@ -236,5 +323,34 @@ func TestPollAWSSSODeviceFlowTerminalErrors(t *testing.T) {
 				t.Error("session not deleted on a terminal error")
 			}
 		})
+	}
+}
+
+// TestPollAWSSSODeviceFlowTransientKeepsSession verifies a transient
+// CreateToken failure (here AWS InternalServerException, a documented-retryable
+// 5xx) does NOT abort the device login: it returns a 5xx and keeps the session
+// so the dashboard's next poll tick can recover.
+func TestPollAWSSSODeviceFlowTransientKeepsSession(t *testing.T) {
+	awsSSOMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Amzn-Errortype", "InternalServerException")
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`{"__type":"InternalServerException","message":"transient"}`))
+	})
+	w, reg := newAWSSSOTestMux()
+	w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: "cid|csec|dc|us-east-1"}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/oauth/device-poll?state=st", nil)
+	w.pollAWSSSODeviceFlow(rec, req, w.sessions["st"])
+
+	if rec.Code < 500 {
+		t.Errorf("status = %d, want a 5xx on a transient error", rec.Code)
+	}
+	if connected, _ := reg.Status("sso"); connected {
+		t.Error("registry shows connected on a transient error — must not persist")
+	}
+	// The session MUST survive so the next poll tick can recover.
+	if _, ok := w.sessions["st"]; !ok {
+		t.Error("session deleted on a transient error; the device login can no longer recover")
 	}
 }

@@ -18,6 +18,19 @@ import (
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
+// pointNewSSOClientAt overrides the newSSOClient seam to build clients against
+// url (anonymous creds — GetRoleCredentials authorizes via the SSO token, not
+// AWS creds) for the test's duration, restoring it on cleanup. Collapses the
+// override that every mock in this file used to copy-paste.
+func pointNewSSOClientAt(t *testing.T, url string) {
+	t.Helper()
+	prev := newSSOClient
+	newSSOClient = func(region string) *sso.Client {
+		return sso.New(sso.Options{Region: region, BaseEndpoint: aws.String(url), Credentials: aws.AnonymousCredentials{}})
+	}
+	t.Cleanup(func() { newSSOClient = prev })
+}
+
 // mockSSO stands up a fake sso GetRoleCredentials endpoint and points
 // newSSOClient at it. It returns a call counter so tests can assert
 // caching (at most one mint per role). Minted creds are the canonical AWS
@@ -37,18 +50,8 @@ func mockSSO(t *testing.T) *int32 {
 			},
 		})
 	}))
-	prev := newSSOClient
-	newSSOClient = func(region string) *sso.Client {
-		return sso.New(sso.Options{
-			Region:       region,
-			BaseEndpoint: aws.String(srv.URL),
-			Credentials:  aws.AnonymousCredentials{},
-		})
-	}
-	t.Cleanup(func() {
-		newSSOClient = prev
-		srv.Close()
-	})
+	t.Cleanup(srv.Close)
+	pointNewSSOClientAt(t, srv.URL)
 	return &calls
 }
 
@@ -70,14 +73,8 @@ func mockSSOPerAccount(t *testing.T) {
 			},
 		})
 	}))
-	prev := newSSOClient
-	newSSOClient = func(region string) *sso.Client {
-		return sso.New(sso.Options{Region: region, BaseEndpoint: aws.String(srv.URL), Credentials: aws.AnonymousCredentials{}})
-	}
-	t.Cleanup(func() {
-		newSSOClient = prev
-		srv.Close()
-	})
+	t.Cleanup(srv.Close)
+	pointNewSSOClientAt(t, srv.URL)
 }
 
 func ssoCredFixture() *AWSSSOCredential {
@@ -171,7 +168,7 @@ func TestAWSSSOCredentialUnknownPlaceholderFailsClosed(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "no role mapping") {
 		t.Fatalf("err = %v, want one mentioning the missing role mapping", err)
 	}
-	if strings.Contains(req.Header.Get("Authorization"), "deadbeef") == false {
+	if !strings.Contains(req.Header.Get("Authorization"), "deadbeef") {
 		t.Errorf("request was re-signed despite no matching role; Authorization = %q", req.Header.Get("Authorization"))
 	}
 	if atomic.LoadInt32(calls) != 0 {
@@ -188,8 +185,14 @@ func TestAWSSSOCredentialNoSigV4Errors(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	if err := c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{}); err == nil {
-		t.Fatal("expected an error when the request carries no SigV4 access-key-id")
+	// No Authorization header set, so there's nothing to re-sign on.
+	err = c.SignHTTPRequest(context.Background(), req, ssoTokenSecret(), struct{}{})
+	if err == nil || !strings.Contains(err.Error(), "no SigV4 access-key-id") {
+		t.Fatalf("err = %v, want one mentioning the missing SigV4 access-key-id", err)
+	}
+	// The request must be left untouched (no auth header invented).
+	if req.Header.Get("Authorization") != "" {
+		t.Errorf("Authorization = %q, want it left unset", req.Header.Get("Authorization"))
 	}
 }
 
@@ -220,11 +223,8 @@ func TestAWSSSOCredentialZeroExpirationErrors(t *testing.T) {
 			},
 		})
 	}))
-	prev := newSSOClient
-	newSSOClient = func(region string) *sso.Client {
-		return sso.New(sso.Options{Region: region, BaseEndpoint: aws.String(srv.URL), Credentials: aws.AnonymousCredentials{}})
-	}
-	t.Cleanup(func() { newSSOClient = prev; srv.Close() })
+	t.Cleanup(srv.Close)
+	pointNewSSOClientAt(t, srv.URL)
 
 	c := ssoCredFixture()
 	req := signedReq(t, "AKIAPROD0ADMIN000000")
@@ -265,11 +265,8 @@ func mockSSOWith(t *testing.T, expiry time.Time, fail bool) (calls *int32, lastB
 			},
 		})
 	}))
-	prev := newSSOClient
-	newSSOClient = func(region string) *sso.Client {
-		return sso.New(sso.Options{Region: region, BaseEndpoint: aws.String(srv.URL), Credentials: aws.AnonymousCredentials{}})
-	}
-	t.Cleanup(func() { newSSOClient = prev; srv.Close() })
+	t.Cleanup(srv.Close)
+	pointNewSSOClientAt(t, srv.URL)
 	return &n, func() string { mu.Lock(); defer mu.Unlock(); return bearer }
 }
 
@@ -288,10 +285,33 @@ func TestAWSSSOCredentialUsesBearerToken(t *testing.T) {
 }
 
 // TestAWSSSOCredentialConcurrentSingleMint asserts a concurrent burst for the
-// same role mints exactly once (the aws.CredentialsCache single-flight). rt is
-// pre-allocated via the Build hook so no two goroutines race the lazy alloc.
+// same role coalesces into ONE mint (the aws.CredentialsCache single-flight),
+// not merely that caching serves the 2nd+ request. The mint BLOCKS until the
+// test releases it: with single-flight, one provider call is in flight and the
+// rest wait on it; without it, every goroutine would find no cached creds and
+// hit the provider (arrived > 1). rt is pre-allocated via Build so no goroutine
+// races the lazy alloc.
 func TestAWSSSOCredentialConcurrentSingleMint(t *testing.T) {
-	calls, _ := mockSSOWith(t, time.Now().Add(time.Hour), false)
+	var arrived int32
+	release := make(chan struct{})
+	entered := make(chan struct{}, 64)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		atomic.AddInt32(&arrived, 1)
+		entered <- struct{}{}
+		<-release // hold the mint open so parallel calls would pile up here
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"roleCredentials": map[string]any{
+				"accessKeyId":     "AKIDEXAMPLE",
+				"secretAccessKey": "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+				"sessionToken":    "FwoGZXIvYXdzEXAMPLE",
+				"expiration":      time.Now().Add(time.Hour).UnixMilli(),
+			},
+		})
+	}))
+	t.Cleanup(srv.Close)
+	pointNewSSOClientAt(t, srv.URL)
+
 	c := ssoCredFixture()
 	if _, d := buildAWSSSO(c, "sso", nil); d.HasErrors() {
 		t.Fatalf("build: %v", d)
@@ -306,6 +326,13 @@ func TestAWSSSOCredentialConcurrentSingleMint(t *testing.T) {
 			errs <- c.SignHTTPRequest(context.Background(), signedReq(t, "AKIAPROD0ADMIN000000"), ssoTokenSecret(), struct{}{})
 		}()
 	}
+	// The first (coalesced) provider call reaches the mock and blocks. Give the
+	// rest a beat to pile up on the single-flight — absent it they'd each hit
+	// the mock instead of waiting.
+	<-entered
+	time.Sleep(100 * time.Millisecond)
+	inFlight := atomic.LoadInt32(&arrived)
+	close(release)
 	wg.Wait()
 	close(errs)
 	for err := range errs {
@@ -313,8 +340,11 @@ func TestAWSSSOCredentialConcurrentSingleMint(t *testing.T) {
 			t.Fatalf("concurrent sign: %v", err)
 		}
 	}
-	if got := atomic.LoadInt32(calls); got != 1 {
-		t.Errorf("GetRoleCredentials called %d times under a concurrent burst, want 1 (single-flight)", got)
+	if inFlight != 1 {
+		t.Errorf("%d GetRoleCredentials calls in flight during the burst, want 1 (single-flight must coalesce)", inFlight)
+	}
+	if got := atomic.LoadInt32(&arrived); got != 1 {
+		t.Errorf("GetRoleCredentials called %d times total, want 1", got)
 	}
 }
 

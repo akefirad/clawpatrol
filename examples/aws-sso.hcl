@@ -35,7 +35,15 @@
 # SPECIFIC service (e.g. S3) give it its own endpoint (host-matched) and
 # attach rules there. JSON-protocol services (DynamoDB, ...) put the IAM
 # action in the X-Amz-Target header as "<Service>.<Action>", so they can be
-# gated by header instead.
+# gated by header instead. Prefer method / header / path rules (as below):
+# they're authoritative.
+#
+# BODY-CONTENT RULES ARE ADVISORY (akefirad/clawpatrol#21, pre-existing): the
+# re-signer trusts the agent's X-Amz-Content-Sha256, so for UNSIGNED-PAYLOAD
+# (S3 doesn't hash-check the body) or a body over the buffer limit, the body
+# AWS ingests can differ from what the rules engine inspected. Don't rely on a
+# CEL rule matching request-body content as a hard security boundary; gate by
+# method/header/path (or deny UNSIGNED-PAYLOAD) instead.
 #
 # !!! POLICY CAVEAT — ROLE SELECTION IS INVISIBLE TO THE RULES ENGINE !!!
 # The rules see method/path/query/headers/body, NOT the matched (account,
@@ -119,6 +127,11 @@ rule "s3-default-deny" {
 }
 
 # ── General AWS policy: reads allowed; a JSON-service write gate ──────
+# CAVEAT: this allows only REST-style reads (GET/HEAD). JSON-protocol services
+# (DynamoDB, and other X-Amz-Target APIs) issue reads as POST too — so a
+# DynamoDB GetItem/Query/Scan does NOT match aws-reads and falls through to
+# aws-default-deny. That's fail-closed (safe), but if you need those reads,
+# add an explicit allow rule keyed on the read actions in X-Amz-Target.
 rule "aws-reads" {
   endpoint  = https.aws
   condition = "http.method in ['GET', 'HEAD']"

@@ -18,8 +18,12 @@ package credentials
 // the dashboard device login that obtains it lives in the gateway's OAuth
 // engine (Flow="aws_sso"). Per-role temporary credentials are cached in
 // memory (aws.CredentialsCache: expiry-margin + single-flight refresh), so
-// a burst of requests triggers at most one GetRoleCredentials call and the
-// cache repopulates from the stored token after a restart. SSO-token
+// a burst of requests triggers at most one GetRoleCredentials call. The cache
+// lives on the credential body, so it's discarded and repopulated from the
+// stored token whenever a fresh body is built — not only a process restart but
+// any config reload / dashboard apply (New+Build run again). Churny config
+// pushes therefore re-mint; correctness is unaffected (the stored SSO token
+// still mints), it just forgoes caching across reloads. SSO-token
 // refresh for long sessions is a later slice (akefirad/clawpatrol#6);
 // multi-role switching + explicit no-profile-deny semantics land in #5.
 //
@@ -54,6 +58,12 @@ var placeholderShape = regexp.MustCompile(`^[A-Z0-9]{16,32}$`)
 
 // awsAccountIDShape is the AWS 12-digit account number.
 var awsAccountIDShape = regexp.MustCompile(`^[0-9]{12}$`)
+
+// awsRegionShape is a lenient AWS region token (lowercase, digits, hyphens).
+// region is operator-authored HCL and the SDK anchors it inside .amazonaws.com
+// (not agent-reachable), so this is legibility hardening, not an SSRF guard: a
+// bad value otherwise surfaces only as a confusing DNS error at request time.
+var awsRegionShape = regexp.MustCompile(`^[a-z0-9-]+$`)
 
 // awsSSOExpiryWindow refreshes cached role credentials this long before
 // their true expiry, so a request never signs with about-to-expire creds
@@ -128,12 +138,14 @@ func (rt *awsSSORuntime) currentToken() string {
 }
 
 func (c *AWSSSOCredential) runtimeState() *awsSSORuntime {
-	// Production credentials are initialized by buildAWSSSO (the Build hook),
-	// so rt is non-nil by request time and this is a plain field read — no
-	// process-global lock across instances. The nil branch only covers
-	// hand-built test instances that skip Build; those are constructed on a
-	// single goroutine, and any test exercising concurrency must initialize
-	// rt first (call buildAWSSSO / newRuntime) so no two goroutines race here.
+	// Framework-created credentials get rt at construction (the New hook), so
+	// rt is non-nil before any request goroutine and this is a plain field
+	// read — no process-global lock, and the safety is structural, not a
+	// comment-only invariant. The nil branch only covers hand-built test
+	// instances (a bare &AWSSSOCredential{} literal, which bypasses New); those
+	// are constructed on a single goroutine, and any test exercising
+	// concurrency must initialize rt first (call newAWSSSORuntime / buildAWSSSO)
+	// so no two goroutines race this write.
 	if c.rt == nil {
 		c.rt = newAWSSSORuntime()
 	}
@@ -182,6 +194,10 @@ func sigV4AccessKeyID(authHeader string) string {
 // the given access-key-id, or nil when none matches.
 func (c *AWSSSOCredential) roleForPlaceholder(akid string) *AWSSSORole {
 	for i := range c.Roles {
+		// The != "" term is defensive: the caller returns early on empty akid
+		// and validation forbids empty placeholders, so it can't change the
+		// result today — it just guards against an empty==empty match if either
+		// invariant ever regresses.
 		if c.Roles[i].Placeholder != "" && c.Roles[i].Placeholder == akid {
 			return &c.Roles[i]
 		}
@@ -272,12 +288,12 @@ func (p *ssoRoleProvider) Retrieve(ctx context.Context) (aws.Credentials, error)
 	if rc == nil || aws.ToString(rc.AccessKeyId) == "" {
 		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: GetRoleCredentials(%s/%s) returned no credentials", p.accountID, p.roleName)
 	}
-	// A zero Expiration would become time.UnixMilli(0) = 1970, which with
-	// CanExpire:true makes aws.CredentialsCache treat the entry as already
-	// expired — so every request re-mints (latency + AWS throttling /
-	// TooManyRequestsException). AWS always populates it; treat a zero as an
-	// error rather than caching a permanently-expired entry.
-	if rc.Expiration == 0 {
+	// A zero (or negative) Expiration would become a 1970/pre-epoch time via
+	// time.UnixMilli, which with CanExpire:true makes aws.CredentialsCache treat
+	// the entry as already expired — so every request re-mints (latency + AWS
+	// throttling / TooManyRequestsException). AWS always populates it; treat
+	// non-positive as an error rather than caching a permanently-expired entry.
+	if rc.Expiration <= 0 {
 		return aws.Credentials{}, fmt.Errorf("aws_sso_credential: GetRoleCredentials(%s/%s) returned no expiration", p.accountID, p.roleName)
 	}
 	return aws.Credentials{
@@ -317,9 +333,17 @@ func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Reques
 		// deferred to keep this additive.
 		return fmt.Errorf("aws_sso_credential: no role mapping for placeholder access-key-id %q", akid)
 	}
+	// sec is whatever gatewaySecretStore.Get returned. It prefers a
+	// credential_secrets DB row over the OAuth bearer token, so if a row exists
+	// under this credential's name — e.g. a type change reusing the name
+	// (aws_credential "foo" → aws_sso_credential "foo"), dev_seed, or a direct
+	// write — sec.Bytes is that row's (empty) value and shadows the connected
+	// SSO token. aws_sso declares no SecretSlots, so this shouldn't happen via
+	// the dashboard, but the error names it so "connected but not signing" is
+	// diagnosable rather than mysterious.
 	ssoToken := string(sec.Bytes)
 	if ssoToken == "" {
-		return fmt.Errorf("aws_sso_credential: no SSO token available (connect AWS SSO in the dashboard)")
+		return fmt.Errorf("aws_sso_credential: no SSO token available — connect AWS SSO in the dashboard (or, if already connected, a credential_secrets row is shadowing the OAuth token under this credential name)")
 	}
 	creds, err := c.roleCreds(ctx, *role, ssoToken)
 	if err != nil {
@@ -329,12 +353,35 @@ func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Reques
 	// understands; reSignProxiedRequest derives service/region from the
 	// request and reuses/recomputes the payload hash. It uses no
 	// AWSCredential receiver state, so a zero-value receiver is fine.
+	//
+	// BODY-CONTENT POLICY CAVEAT (akefirad/clawpatrol#21, pre-existing in
+	// reSignProxiedRequest): the re-signer trusts the agent's
+	// X-Amz-Content-Sha256. For UNSIGNED-PAYLOAD (S3 doesn't hash-check) or a
+	// body over DefaultBodyBufferLimit, the body AWS ingests can differ from
+	// what the rules engine saw — so a body-content rule on an AWS endpoint is
+	// advisory for those requests, now under an SSO-minted role too. Method/
+	// header/path rules (the shipped examples) are unaffected. Real fix edits
+	// aws.go; deferred (#21).
 	roleSec := runtime.Secret{Extras: map[string]string{
 		"access_key_id":     creds.AccessKeyID,
 		"secret_access_key": creds.SecretAccessKey,
 		"session_token":     creds.SessionToken,
 	}}
-	return (&AWSCredential{}).reSignProxiedRequest(ctx, req, roleSec)
+	if err := (&AWSCredential{}).reSignProxiedRequest(ctx, req, roleSec); err != nil {
+		// Wrap so the failure carries this credential's prefix — otherwise it
+		// surfaces as "aws_credential: …" (and main.go logs "sign <name>:
+		// aws_credential: …"), which an operator grepping for aws_sso_credential
+		// would miss.
+		//
+		// NOTE: unlike the early returns above (which leave the agent's
+		// placeholder signature intact for AWS to reject), reSignProxiedRequest
+		// strips Authorization + X-Amz-Security-Token BEFORE v4.SignHTTP, so on
+		// a re-sign failure main.go's fail-open forwards a request with NO auth
+		// header (still rejected by AWS — no unintended-identity egress). The
+		// true gateway-level fail-closed (#16) would make this moot.
+		return fmt.Errorf("aws_sso_credential: re-sign: %w", err)
+	}
+	return nil
 }
 
 // OAuthFlow is part of the clawpatrol plugin API. It registers this
@@ -393,6 +440,8 @@ func validateAWSSSO(decoded any, name string, _ *config.BuildCtx) hcl.Diagnostic
 	}
 	if c.Region == "" {
 		add("region is required (the SSO region)")
+	} else if !awsRegionShape.MatchString(c.Region) {
+		add(fmt.Sprintf("region %q is not a valid AWS region (lowercase letters, digits, hyphens)", c.Region))
 	}
 	if len(c.Roles) == 0 {
 		add("must declare at least one role mapping")
@@ -433,9 +482,13 @@ func init() {
 	var _ runtime.HTTPRequestSigner = (*AWSSSOCredential)(nil)
 	var _ config.OAuthFlowProvider = (*AWSSSOCredential)(nil)
 	config.Register(&config.Plugin{
-		Kind:     config.KindCredential,
-		Type:     "aws_sso_credential",
-		New:      newer[AWSSSOCredential](),
+		Kind: config.KindCredential,
+		Type: "aws_sso_credential",
+		// Allocate rt at construction so every framework-created instance has
+		// non-nil runtime state before decode/Build/any request goroutine — the
+		// concurrency-safety of runtimeState() is then structural, not a
+		// comment-only invariant (buildAWSSSO re-inits once at load as a belt).
+		New:      func() any { return &AWSSSOCredential{rt: newAWSSSORuntime()} },
 		Runtime:  (*AWSSSOCredential)(nil),
 		Validate: validateAWSSSO,
 		Build:    buildAWSSSO,

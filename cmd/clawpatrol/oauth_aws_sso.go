@@ -17,6 +17,8 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -26,6 +28,24 @@ import (
 	ssooidctypes "github.com/aws/aws-sdk-go-v2/service/ssooidc/types"
 	"golang.org/x/oauth2"
 )
+
+// isRetryableCreateTokenErr reports whether a CreateToken failure is transient
+// rather than terminal: the oauthUpstreamTimeout deadline / a cancel, a network
+// error, or AWS InternalServerException (a documented-retryable 5xx). Such a
+// blip during the approval window must NOT abort the device login — keep the
+// session so the next poll tick recovers, mirroring pollOpenAIDeviceFlow /
+// pollDeviceFlow (which return a 5xx and keep the session).
+func isRetryableCreateTokenErr(ctx context.Context, err error) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	var ise *ssooidctypes.InternalServerException
+	return errors.As(err, &ise)
+}
 
 // newSSOOIDCClient builds the ssooidc client for a region. A package var
 // so tests can point it at a mock server (ssooidc RegisterClient /
@@ -66,7 +86,10 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 		ClientType: aws.String("public"),
 	})
 	if err != nil {
-		http.Error(rw, "aws_sso register client: "+err.Error(), http.StatusBadGateway)
+		// Log the raw aws-sdk detail server-side; return a generic message to
+		// the browser (matches the codebase's don't-surface-raw-detail rule).
+		log.Printf("aws_sso register client: %v", err)
+		http.Error(rw, "aws_sso: register client failed", http.StatusBadGateway)
 		return
 	}
 	da, err := client.StartDeviceAuthorization(ctx, &ssooidc.StartDeviceAuthorizationInput{
@@ -75,7 +98,16 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 		StartUrl:     aws.String(startURL),
 	})
 	if err != nil {
-		http.Error(rw, "aws_sso start device authorization: "+err.Error(), http.StatusBadGateway)
+		log.Printf("aws_sso start device authorization: %v", err)
+		http.Error(rw, "aws_sso: start device authorization failed", http.StatusBadGateway)
+		return
+	}
+	// Defensive (mirrors startOpenAIDeviceFlow rejecting empty fields): a 200
+	// with an empty user/device code would otherwise render a blank Connect
+	// card and make every poll fail opaquely. AWS populates these on success.
+	if aws.ToString(da.UserCode) == "" || aws.ToString(da.DeviceCode) == "" {
+		log.Printf("aws_sso start device authorization: empty user/device code in response")
+		http.Error(rw, "aws_sso: empty device authorization response", http.StatusBadGateway)
 		return
 	}
 
@@ -87,13 +119,14 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 		created: time.Now(),
 		// Pack the fields pollAWSSSODeviceFlow needs (CreateToken has no
 		// session of its own) into verifier, mirroring openai_device.
+		// No cfg: pollAWSSSODeviceFlow reads everything from verifier and never
+		// dereferences sess.cfg (unlike openai_device, which does).
 		verifier: strings.Join([]string{
 			aws.ToString(reg.ClientId),
 			aws.ToString(reg.ClientSecret),
 			aws.ToString(da.DeviceCode),
 			region,
 		}, "|"),
-		cfg: &oauth2.Config{ClientID: aws.ToString(reg.ClientId)},
 	}
 	for k, s := range w.sessions {
 		if time.Since(s.created) > 10*time.Minute {
@@ -156,6 +189,15 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 			writeJSON(rw, map[string]string{"error": "slow_down"})
 			return
 		}
+		// Transient failure (ctx deadline, network blip, AWS 5xx): keep the
+		// session and return a 5xx so the dashboard's next poll tick recovers,
+		// instead of aborting the whole device login on one hiccup during the
+		// approval window. Mirrors the sibling device flows.
+		if isRetryableCreateTokenErr(ctx, err) {
+			log.Printf("aws_sso poll: transient CreateToken error (keeping session): %v", err)
+			http.Error(rw, "aws_sso poll: temporary upstream error", http.StatusBadGateway)
+			return
+		}
 		// Everything below is terminal (the dashboard stops polling on any
 		// non-pending error). Delete the dead session now rather than letting
 		// it linger until the 10-minute GC.
@@ -175,10 +217,17 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 			writeJSON(rw, map[string]string{"error": "access_denied"})
 			return
 		}
-		writeJSON(rw, map[string]any{"error": "create_token", "detail": err.Error()})
+		// Unknown terminal error: log the raw aws-sdk detail server-side, return
+		// a generic code to the browser (no raw operation/RequestID/endpoint).
+		log.Printf("aws_sso poll: CreateToken failed: %v", err)
+		writeJSON(rw, map[string]string{"error": "create_token"})
 		return
 	}
 	if aws.ToString(out.AccessToken) == "" {
+		// A success (err==nil) with no access token is an upstream anomaly, not
+		// a real pending state — treat as pending (avoid persisting an empty
+		// token) but log it, so it doesn't silently spin until code expiry.
+		log.Printf("aws_sso poll: CreateToken succeeded with an empty access token (treating as pending)")
 		writeJSON(rw, map[string]string{"error": "authorization_pending"})
 		return
 	}
@@ -204,8 +253,20 @@ func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, s
 	delete(w.sessions, sess.state)
 	w.mu.Unlock()
 	if err := w.g.oauth.Set(r.Context(), sess.id, tok); err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		// The device code is already consumed, so a successfully-minted SSO
+		// token is being lost here — log it (this is the only server-side
+		// trace) and return a generic message rather than echoing the raw
+		// (possibly DB-driver) error to the browser.
+		log.Printf("aws_sso poll: persist token for %q failed: %v", sess.id, err)
+		http.Error(rw, "aws_sso: failed to persist token", http.StatusInternalServerError)
 		return
 	}
-	writeJSON(rw, map[string]any{"connected": true, "expires": tok.Expiry.Unix()})
+	resp := map[string]any{"connected": true}
+	// Only report an expiry when there's a real one — a zero tok.Expiry would
+	// otherwise serialize as a year-1 epoch. (AWS always returns ExpiresIn; the
+	// dashboard reads expires_at from the status endpoint regardless.)
+	if !tok.Expiry.IsZero() {
+		resp["expires"] = tok.Expiry.Unix()
+	}
+	writeJSON(rw, resp)
 }
