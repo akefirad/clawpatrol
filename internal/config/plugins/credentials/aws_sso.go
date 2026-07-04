@@ -343,7 +343,14 @@ func (c *AWSSSOCredential) SignHTTPRequest(ctx context.Context, req *http.Reques
 		"secret_access_key": creds.SecretAccessKey,
 		"session_token":     creds.SessionToken,
 	}}
-	return (&AWSCredential{}).reSignProxiedRequest(ctx, req, roleSec)
+	if err := (&AWSCredential{}).reSignProxiedRequest(ctx, req, roleSec); err != nil {
+		// Wrap so the failure carries this credential's prefix — otherwise it
+		// surfaces as "aws_credential: …" (and main.go logs "sign <name>:
+		// aws_credential: …"), which an operator grepping for aws_sso_credential
+		// would miss.
+		return fmt.Errorf("aws_sso_credential: re-sign: %w", err)
+	}
+	return nil
 }
 
 // OAuthFlow is part of the clawpatrol plugin API. It registers this
