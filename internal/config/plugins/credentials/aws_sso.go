@@ -69,6 +69,20 @@ type AWSSSORole struct {
 
 // AWSSSOCredential is the aws_sso_credential plugin body: one SSO
 // authentication plus a list of role mappings.
+//
+// POLICY CAVEAT: role selection is invisible to the rules engine. The http
+// facet exposes method/path/query/headers/body — not the matched
+// (account, role) — so every role on one credential shares ONE policy
+// surface: an endpoint's rules are effectively the UNION across all its
+// mapped roles. An agent that can pass the shared rules can mint the most
+// privileged configured role. To isolate a high-privilege role, put it on
+// its OWN aws_sso_credential bound to its OWN endpoint (host-matched), and
+// attach the stricter rules there.
+//
+// IMPROVEMENT: expose the matched (account, role) to policy — a CEL-visible
+// field or per-role endpoint bindings — so rules can discriminate per role
+// instead of per shared endpoint. Deferred: it touches the facet/policy
+// engine, not just this plugin.
 type AWSSSOCredential struct {
 	// StartURL is the AWS access portal URL of the IAM Identity Center
 	// instance (e.g. https://mycompany.awsapps.com/start).

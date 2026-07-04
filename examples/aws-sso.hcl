@@ -18,6 +18,22 @@
 # attach rules there. JSON-protocol services (DynamoDB, ...) put the IAM
 # action in the X-Amz-Target header as "<Service>.<Action>", so they can be
 # gated by header instead.
+#
+# !!! POLICY CAVEAT — ROLE SELECTION IS INVISIBLE TO THE RULES ENGINE !!!
+# The rules see method/path/query/headers/body, NOT the matched (account,
+# role). So every role on ONE credential shares ONE policy surface: an
+# endpoint's rules are the UNION across all its roles. In the example below,
+# a GET allowed by `aws-reads` is allowed no matter WHICH placeholder the
+# agent signed with — ReadOnly or Admin. An agent that passes the shared
+# rules can always mint the most privileged configured role.
+#   => Isolate a high-privilege role: put it on its OWN aws_sso_credential
+#      bound to its OWN endpoint, and attach the stricter rules there. Do NOT
+#      mix a privileged role with low-privilege ones on a shared endpoint
+#      (as ReadOnly + Admin are mixed below purely to show the mechanics).
+# IMPROVEMENT: expose the matched (account, role) to CEL — a policy-visible
+# field, or per-role endpoint bindings — so rules can discriminate per role
+# instead of per shared endpoint. Deferred (touches the facet/policy engine,
+# not just this plugin).
 
 credential "aws_sso_credential" "sso" {
   start_url = "https://my-org.awsapps.com/start"
