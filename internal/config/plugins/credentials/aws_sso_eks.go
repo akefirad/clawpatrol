@@ -127,10 +127,15 @@ func (c *AWSSSOEKSCredential) SignHTTPRequest(ctx context.Context, req *http.Req
 	// Bound the mint: it is the only network hop in this signer and runs on
 	// the proxied request's context, which typically carries no deadline —
 	// a hung or mid-response-stalled SSO portal would otherwise wedge the
-	// cluster request for as long as the agent holds the connection (the
-	// default SDK retryer only makes that worse). The account/role are
-	// already named by the minter's own error wrap, so this call site drops
-	// the pair to avoid a doubled "A/R … A/R" chain.
+	// cluster request for as long as the agent holds the connection. This
+	// ctx timeout bounds the *caller*: the outer CredentialsCache.Retrieve
+	// returns after ssoMintTimeout. It does NOT itself cancel the in-flight
+	// GetRoleCredentials — Retrieve runs the provider under a suppressedContext
+	// that nils this deadline — so the network op is bounded separately by the
+	// SSO client's own http.Client timeout (see newSSOClient in
+	// aws_sso_minter.go). The account/role are already named by the minter's
+	// own error wrap, so this call site drops the pair to avoid a doubled
+	// "A/R … A/R" chain.
 	mintCtx, cancel := context.WithTimeout(ctx, ssoMintTimeout)
 	defer cancel()
 	creds, err := c.minterFor(token).credentials(mintCtx, account, role)

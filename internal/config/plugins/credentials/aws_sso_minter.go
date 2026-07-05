@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/aws/aws-sdk-go-v2/service/sso"
 )
 
@@ -48,6 +49,18 @@ func newSSOClient(region string) *sso.Client {
 	return sso.New(sso.Options{
 		Region:      region,
 		Credentials: aws.AnonymousCredentials{},
+		// Bound the network op itself. The caller wraps the mint in a
+		// ssoMintTimeout context, but aws.CredentialsCache.Retrieve runs this
+		// client's GetRoleCredentials under a suppressedContext that nils the
+		// caller's Done/Deadline — so that ctx timeout unblocks the caller but
+		// cannot cancel the in-flight HTTP call. Against a portal that accepts
+		// but never responds, the goroutine + TCP conn would otherwise leak
+		// until the transport's own (default-absent) timeout. Give the client
+		// an http.Client timeout matching ssoMintTimeout as that backstop, and
+		// cap retries to 1 so a default retryer can't multiply the bound
+		// (N attempts × timeout).
+		HTTPClient:       awshttp.NewBuildableClient().WithTimeout(ssoMintTimeout),
+		RetryMaxAttempts: 1,
 	})
 }
 

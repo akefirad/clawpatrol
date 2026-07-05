@@ -106,6 +106,11 @@ func TestValidateKubernetesEndpointEKSSSOParams(t *testing.T) {
 			wantErr: "12 digits",
 		},
 		{
+			name:    "account id too long",
+			ep:      &KubernetesEndpoint{Hosts: []string{"eks.example"}, ClusterName: "c", Region: "us-west-2", AccountID: "1234567890123", RoleName: "EKSAdmin"},
+			wantErr: "12 digits",
+		},
+		{
 			name:    "account id non-numeric",
 			ep:      &KubernetesEndpoint{Hosts: []string{"eks.example"}, ClusterName: "c", Region: "us-west-2", AccountID: "12345678901x", RoleName: "EKSAdmin"},
 			wantErr: "12 digits",
