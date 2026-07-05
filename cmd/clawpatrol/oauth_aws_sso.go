@@ -19,11 +19,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log"
 	"net"
 	"net/http"
-	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -38,7 +38,21 @@ import (
 // blip during the approval window must NOT abort the device login — keep the
 // session so the next poll tick recovers, mirroring pollOpenAIDeviceFlow /
 // pollDeviceFlow (which return a 5xx and keep the session).
+//
+// Terminal ssooidc errors (AccessDenied / ExpiredToken / UnauthorizedClient)
+// are classified FIRST, before the ctx.Err() transient short-circuit: ctx
+// derives from the request, so a browser navigating away mid-poll cancels it,
+// and a terminal error arriving on that same tick would otherwise be
+// misclassified as transient and leave the dead session lingering until the
+// 10-minute GC instead of being deleted immediately. (authorization_pending /
+// slow_down are handled by the caller before this and stay transient.)
 func isRetryableCreateTokenErr(ctx context.Context, err error) bool {
+	var denied *ssooidctypes.AccessDeniedException
+	var expired *ssooidctypes.ExpiredTokenException
+	var unauthorized *ssooidctypes.UnauthorizedClientException
+	if errors.As(err, &denied) || errors.As(err, &expired) || errors.As(err, &unauthorized) {
+		return false
+	}
 	if ctx.Err() != nil {
 		return true
 	}
@@ -56,6 +70,19 @@ func isRetryableCreateTokenErr(ctx context.Context, err error) bool {
 // credentials are configured).
 var newSSOOIDCClient = func(region string) *ssooidc.Client {
 	return ssooidc.New(ssooidc.Options{Region: region})
+}
+
+// awsSSODeviceSession carries the ssooidc fields pollAWSSSODeviceFlow needs
+// to complete CreateToken (which has no session of its own). It is
+// JSON-encoded into oauthSession.verifier at start and decoded on poll.
+// JSON, not a delimiter join: AWS returns an opaque clientSecret/deviceCode
+// whose charset is undocumented, and a literal '|' in either would misalign
+// a pipe-packed tail (folding the device code / region forward).
+type awsSSODeviceSession struct {
+	ClientID     string `json:"client_id"`
+	ClientSecret string `json:"client_secret"`
+	DeviceCode   string `json:"device_code"`
+	Region       string `json:"region"`
 }
 
 // startAWSSSODeviceFlow kicks off the ssooidc device flow: dynamically
@@ -115,6 +142,19 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 		return
 	}
 
+	// Pack the fields pollAWSSSODeviceFlow needs into verifier as JSON.
+	sessData, err := json.Marshal(awsSSODeviceSession{
+		ClientID:     aws.ToString(reg.ClientId),
+		ClientSecret: aws.ToString(reg.ClientSecret),
+		DeviceCode:   aws.ToString(da.DeviceCode),
+		Region:       region,
+	})
+	if err != nil {
+		log.Printf("aws_sso start: encode session: %v", err)
+		http.Error(rw, "aws_sso: encode session failed", http.StatusInternalServerError)
+		return
+	}
+
 	state := randomString(32)
 	w.mu.Lock()
 	w.sessions[state] = &oauthSession{
@@ -128,15 +168,8 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 		// on a nil cfg. Every other flow stashes a non-nil cfg; keep that
 		// invariant with a minimal one so the exchange path degrades to a
 		// failed HTTP call instead of a nil-pointer panic.
-		cfg: &oauth2.Config{ClientID: aws.ToString(reg.ClientId)},
-		// Pack the fields pollAWSSSODeviceFlow needs (CreateToken has no
-		// session of its own) into verifier, mirroring openai_device.
-		verifier: strings.Join([]string{
-			aws.ToString(reg.ClientId),
-			aws.ToString(reg.ClientSecret),
-			aws.ToString(da.DeviceCode),
-			region,
-		}, "|"),
+		cfg:      &oauth2.Config{ClientID: aws.ToString(reg.ClientId)},
+		verifier: string(sessData),
 	}
 	for k, s := range w.sessions {
 		if time.Since(s.created) > 10*time.Minute {
@@ -170,12 +203,13 @@ func (w *webMux) startAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, 
 // slow_down are surfaced to the dashboard's polling loop; success persists
 // the SSO access + refresh token through the standard registry path.
 func (w *webMux) pollAWSSSODeviceFlow(rw http.ResponseWriter, r *http.Request, sess *oauthSession) {
-	parts := strings.SplitN(sess.verifier, "|", 4)
-	if len(parts) != 4 {
+	var sd awsSSODeviceSession
+	if err := json.Unmarshal([]byte(sess.verifier), &sd); err != nil ||
+		sd.ClientID == "" || sd.ClientSecret == "" || sd.DeviceCode == "" || sd.Region == "" {
 		http.Error(rw, "aws_sso: corrupt session", http.StatusInternalServerError)
 		return
 	}
-	clientID, clientSecret, deviceCode, region := parts[0], parts[1], parts[2], parts[3]
+	clientID, clientSecret, deviceCode, region := sd.ClientID, sd.ClientSecret, sd.DeviceCode, sd.Region
 
 	ctx, cancel := context.WithTimeout(r.Context(), oauthUpstreamTimeout)
 	defer cancel()
