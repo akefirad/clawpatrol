@@ -101,7 +101,7 @@ func (*AWSCredential) MintEKSBearer(ctx context.Context, sec runtime.Secret, reg
 	if err != nil {
 		return "", err
 	}
-	return mintEKSBearerToken(ctx, akid, secret, token, region, cluster)
+	return mintEKSBearerToken(ctx, "aws_credential", akid, secret, token, region, cluster)
 }
 
 // reSignProxiedRequest replaces the agent's placeholder-cred SigV4
@@ -264,7 +264,11 @@ func awsCredentialMaterial(sec runtime.Secret) (akid, secret, token string, err 
 // `x-k8s-aws-id` header carrying the cluster name — same wire format
 // `aws eks get-token` emits, just generated in-process so we don't
 // shell out and don't need ambient AWS creds.
-func mintEKSBearerToken(ctx context.Context, akid, secret, sessionToken, region, cluster string) (string, error) {
+//
+// prefix is the calling credential's error-provenance tag
+// (e.g. "aws_credential", "aws_sso_eks_credential") so a presign
+// failure logs against the credential that actually owns the request.
+func mintEKSBearerToken(ctx context.Context, prefix, akid, secret, sessionToken, region, cluster string) (string, error) {
 	cfg := aws.Config{
 		Region:      region,
 		Credentials: awscreds.NewStaticCredentialsProvider(akid, secret, sessionToken),
@@ -276,7 +280,7 @@ func mintEKSBearerToken(ctx context.Context, akid, secret, sessionToken, region,
 	})
 	out, err := presigner.PresignGetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
 	if err != nil {
-		return "", fmt.Errorf("aws_credential: presign sts GetCallerIdentity: %w", err)
+		return "", fmt.Errorf("%s: presign sts GetCallerIdentity: %w", prefix, err)
 	}
 	return "k8s-aws-v1." + base64.RawURLEncoding.EncodeToString([]byte(out.URL)), nil
 }

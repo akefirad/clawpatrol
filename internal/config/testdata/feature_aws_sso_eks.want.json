@@ -1,0 +1,72 @@
+{
+  "defaults": {
+    "llm_fail_mode": "closed",
+    "unknown_host": "passthrough"
+  },
+  "gateway": {
+    "public_url": "https://gw.example.test",
+    "state_dir": "/opt/clawpatrol",
+    "wireguard": {
+      "subnet_cidr": "10.55.0.0/24"
+    }
+  },
+  "policy": {
+    "credentials": {
+      "corp-sso": {
+        "body": {
+          "StartURL": "https://my-org.awsapps.com/start",
+          "Region": "eu-central-1"
+        },
+        "endpoint": "eks-corp-prod",
+        "type": "aws_sso_eks_credential"
+      }
+    },
+    "endpoints": {
+      "eks-corp-prod": {
+        "body": {
+          "Hosts": [
+            "*.gr7.us-east-2.eks.amazonaws.com"
+          ],
+          "Server": "",
+          "CACert": "",
+          "ClusterName": "corp-prod",
+          "Region": "us-east-2",
+          "AccountID": "123456789012",
+          "RoleName": "EKSAdmin"
+        },
+        "family": "k8s",
+        "type": "kubernetes"
+      }
+    },
+    "profiles": {
+      "default": {
+        "credentials": [
+          "corp-sso"
+        ]
+      }
+    },
+    "rules": {
+      "eks-default": {
+        "body": {
+          "name": "eks-default",
+          "family": "k8s",
+          "endpoints": [
+            "eks-corp-prod"
+          ],
+          "verdict": "deny"
+        }
+      },
+      "eks-reads": {
+        "body": {
+          "name": "eks-reads",
+          "family": "k8s",
+          "endpoints": [
+            "eks-corp-prod"
+          ],
+          "condition": "k8s.verb in ['get', 'list', 'watch']",
+          "verdict": "allow"
+        }
+      }
+    }
+  }
+}

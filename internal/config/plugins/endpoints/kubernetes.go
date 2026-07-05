@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
+	"fmt"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclwrite"
@@ -118,8 +119,70 @@ func (e *KubernetesEndpoint) ConfigureUpstreamTLS(cfg *tls.Config) error {
 // endpoints can declare either `hosts = [...]` (managed clusters) or
 // `server = "..."` (self-hosted); EndpointHosts() returns whichever
 // is set, so the shared validateHosts check covers both shapes.
+//
+// It also validates the aws_sso_eks_credential auth params
+// (account_id / role_name and their cluster_name + region dependency)
+// at load time: these strings feed straight into sso:GetRoleCredentials
+// and the STS presign, and — given the host forwards without injection
+// on a sign error — a typo'd or half-configured pair would otherwise
+// surface only at request time (as an unauthenticated apiserver call),
+// never as a load failure the operator can see.
 func validateKubernetesEndpoint(d any, name string, ctx *config.BuildCtx) hcl.Diagnostics {
-	return validateHosts(d, name, ctx.Block.DefRange)
+	defRange := ctx.Block.DefRange
+	diags := validateHosts(d, name, defRange)
+
+	e, ok := d.(*KubernetesEndpoint)
+	if !ok {
+		return diags
+	}
+
+	// account_id + role_name are the EKS SSO role selector and must be
+	// configured as a pair: half a pair can never mint.
+	if (e.AccountID == "") != (e.RoleName == "") {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("Incomplete EKS SSO auth params on endpoint %q", name),
+			Detail:   "account_id and role_name must be set together (both or neither); one without the other cannot select an AWS SSO role to assume.",
+			Subject:  &defRange,
+		})
+	}
+
+	// A valid AWS account id is exactly 12 digits.
+	if e.AccountID != "" && !isAWSAccountID(e.AccountID) {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("Invalid account_id on endpoint %q", name),
+			Detail:   fmt.Sprintf("account_id must be exactly 12 digits, got %q.", e.AccountID),
+			Subject:  &defRange,
+		})
+	}
+
+	// EKS SSO auth also needs the cluster + STS region the presign is
+	// scoped to; without them the credential cannot mint a bearer.
+	if (e.AccountID != "" || e.RoleName != "") && (e.ClusterName == "" || e.Region == "") {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("Incomplete EKS auth params on endpoint %q", name),
+			Detail:   "cluster_name and region are required when account_id / role_name are set (they scope the STS GetCallerIdentity presign for the EKS bearer).",
+			Subject:  &defRange,
+		})
+	}
+
+	return diags
+}
+
+// isAWSAccountID reports whether s is exactly 12 ASCII digits — the
+// shape of an AWS account id.
+func isAWSAccountID(s string) bool {
+	if len(s) != 12 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func init() {
