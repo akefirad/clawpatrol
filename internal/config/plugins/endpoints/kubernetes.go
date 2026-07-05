@@ -37,7 +37,18 @@ type KubernetesEndpoint struct {
 	// ClusterName is the EKS cluster name used by aws_credential.
 	ClusterName string `hcl:"cluster_name,optional"`
 	// Region is the AWS region used by aws_credential for EKS auth.
+	// This is the cluster/STS region (where the STS GetCallerIdentity
+	// presign is scoped), independent of the SSO portal region carried
+	// by aws_sso_eks_credential.
 	Region string `hcl:"region,optional"`
+	// AccountID is the 12-digit AWS account id whose role
+	// aws_sso_eks_credential assumes for this cluster via
+	// sso:GetRoleCredentials. Optional — only the SSO EKS credential
+	// reads it; the static-key aws_credential ignores it.
+	AccountID string `hcl:"account_id,optional"`
+	// RoleName is the AWS SSO role name aws_sso_eks_credential assumes in
+	// AccountID for this cluster. Optional — see AccountID.
+	RoleName string `hcl:"role_name,optional"`
 }
 
 // EndpointHosts is part of the clawpatrol plugin API.
@@ -67,6 +78,17 @@ func (e *KubernetesEndpoint) FileIncludeFields() []config.FileIncludeField {
 // KubernetesEndpoint internals.
 func (e *KubernetesEndpoint) AWSEKSAuthParams() (cluster, region string) {
 	return e.ClusterName, e.Region
+}
+
+// AWSEKSSSOAuthParams is the widened contract aws_sso_eks_credential
+// reads at request time: alongside the cluster + region that
+// AWSEKSAuthParams already exposes, it surfaces the target account id +
+// role name so the credential can exchange an SSO access token for
+// temporary role credentials via sso:GetRoleCredentials. Kept separate
+// from AWSEKSAuthParams so the static-key aws_credential path is
+// untouched.
+func (e *KubernetesEndpoint) AWSEKSSSOAuthParams() (cluster, region, account, role string) {
+	return e.ClusterName, e.Region, e.AccountID, e.RoleName
 }
 
 // ConfigureUpstreamTLS pins cfg.RootCAs to the cluster CA when the
@@ -124,6 +146,12 @@ func init() {
 			}
 			if e.Region != "" {
 				b.SetAttributeValue("region", cty.StringVal(e.Region))
+			}
+			if e.AccountID != "" {
+				b.SetAttributeValue("account_id", cty.StringVal(e.AccountID))
+			}
+			if e.RoleName != "" {
+				b.SetAttributeValue("role_name", cty.StringVal(e.RoleName))
 			}
 		},
 	})
