@@ -186,7 +186,7 @@ approver "llm_approver" "example" {
 
 Block syntax: `credential "<type>" "<name>" { ... }`
 
-Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`telegram_bot_token`](#credential-telegrambottoken).
+Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`aws_sso_eks_credential`](#credential-awsssoekscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`telegram_bot_token`](#credential-telegrambottoken).
 
 ### `credential "anthropic_manual_key" "<name>"`
 
@@ -216,6 +216,25 @@ _No configurable attributes._
 
 ```hcl
 credential "aws_credential" "example" {}
+```
+
+### `credential "aws_sso_eks_credential" "<name>"`
+
+StartURL + Region drive the aws_sso OAuth flow (see OAuthFlow): the
+start URL is the SSO access-portal URL, and Region is the SSO portal
+region. There is no secret slot — the SSO access token is delivered as
+the runtime Secret by the core OAuth device flow.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `start_url` | `string` | yes | The AWS SSO access-portal start URL, e.g. https://my-org.awsapps.com/start. |
+| `region` | `string` | yes | The SSO portal region — where GetRoleCredentials is called. Independent of the cluster/STS region on the endpoint. |
+
+```hcl
+credential "aws_sso_eks_credential" "example" {
+  start_url = "example"
+  region = "example"
+}
 ```
 
 ### `credential "basic_auth" "<name>"`
@@ -521,7 +540,9 @@ Family: `k8s`.
 | `server` | `string` | no | The Kubernetes API server URL or host:port used when hosts is not set. |
 | `ca_cert` | `string` | no | The PEM-encoded cluster CA, often loaded with `<<file:cluster-ca.pem>>`. |
 | `cluster_name` | `string` | no | The EKS cluster name used by aws_credential. |
-| `region` | `string` | no | The AWS region used by aws_credential for EKS auth. |
+| `region` | `string` | no | The AWS region used by aws_credential for EKS auth. This is the cluster/STS region (where the STS GetCallerIdentity presign is scoped), independent of the SSO portal region carried by aws_sso_eks_credential. |
+| `account_id` | `string` | no | The 12-digit AWS account id whose role aws_sso_eks_credential assumes for this cluster via sso:GetRoleCredentials. Optional — only the SSO EKS credential reads it; the static-key aws_credential ignores it. |
+| `role_name` | `string` | no | The AWS SSO role name aws_sso_eks_credential assumes in AccountID for this cluster. Optional — see AccountID. |
 
 ```hcl
 endpoint "kubernetes" "example" {}
