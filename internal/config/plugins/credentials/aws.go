@@ -275,7 +275,7 @@ func mintEKSBearerToken(ctx context.Context, prefix, akid, secret, sessionToken,
 	}
 	presigner := sts.NewPresignClient(sts.NewFromConfig(cfg), func(o *sts.PresignOptions) {
 		o.ClientOptions = append(o.ClientOptions, func(co *sts.Options) {
-			co.APIOptions = append(co.APIOptions, eksPresignMiddleware(cluster))
+			co.APIOptions = append(co.APIOptions, eksPresignMiddleware(prefix, cluster))
 		})
 	})
 	out, err := presigner.PresignGetCallerIdentity(ctx, &sts.GetCallerIdentityInput{})
@@ -296,14 +296,14 @@ func mintEKSBearerToken(ctx context.Context, prefix, akid, secret, sessionToken,
 //
 // The signer runs in Finalize, so mutating the request in Build
 // (After) guarantees both pieces are part of the signature.
-func eksPresignMiddleware(cluster string) func(*smithymiddleware.Stack) error {
+func eksPresignMiddleware(prefix, cluster string) func(*smithymiddleware.Stack) error {
 	return func(stack *smithymiddleware.Stack) error {
 		return stack.Build.Add(smithymiddleware.BuildMiddlewareFunc(
 			"clawpatrolEKSPresign",
 			func(ctx context.Context, in smithymiddleware.BuildInput, next smithymiddleware.BuildHandler) (smithymiddleware.BuildOutput, smithymiddleware.Metadata, error) {
 				r, ok := in.Request.(*smithyhttp.Request)
 				if !ok {
-					return smithymiddleware.BuildOutput{}, smithymiddleware.Metadata{}, fmt.Errorf("aws_credential: unexpected smithy request type %T", in.Request)
+					return smithymiddleware.BuildOutput{}, smithymiddleware.Metadata{}, fmt.Errorf("%s: unexpected smithy request type %T", prefix, in.Request)
 				}
 				r.Header.Set("X-K8s-Aws-Id", cluster)
 				// aws-iam-authenticator caps presigned URL age at
