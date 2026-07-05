@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
@@ -41,6 +42,14 @@ import (
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
+
+// ssoMintTimeout bounds the single sso:GetRoleCredentials mint this
+// credential performs on the proxied request's context (which typically
+// carries no deadline). The OAuth flows bound their upstream calls with
+// the analogous main.oauthUpstreamTimeout; this is the credential-package
+// counterpart, since that const is not exported. The STS presign is local
+// computation and is deliberately left unbounded.
+const ssoMintTimeout = 15 * time.Second
 
 // AWSSSOEKSCredential is part of the clawpatrol plugin API.
 //
@@ -79,8 +88,14 @@ type awsEKSSSOParams interface {
 }
 
 // SignHTTPRequest is part of the clawpatrol plugin API. It fails closed
-// on any missing input (endpoint params, account/role, SSO token) rather
-// than minting or forwarding an unauthenticated request.
+// on any missing input (endpoint params, account/role, SSO token) by
+// returning an error rather than stamping a bad or unauthenticated
+// bearer. This is credential-level fail-closed only: on a sign error the
+// host (cmd/clawpatrol/main.go) currently logs and still forwards the
+// request upstream without injection (shared behavior with
+// aws_credential), so these branches prevent a bad bearer but do not by
+// themselves stop the request from reaching the apiserver. Returning a
+// host-layer 502 on kubernetes sign errors is tracked as a follow-up.
 func (c *AWSSSOEKSCredential) SignHTTPRequest(ctx context.Context, req *http.Request, sec runtime.Secret, endpoint any) error {
 	params, ok := endpoint.(awsEKSSSOParams)
 	if !ok {
@@ -109,16 +124,28 @@ func (c *AWSSSOEKSCredential) SignHTTPRequest(ctx context.Context, req *http.Req
 		return errors.New("aws_sso_eks_credential: no AWS SSO session — reconnect AWS SSO in the dashboard")
 	}
 
-	creds, err := c.minterFor(token).credentials(ctx, account, role)
+	// Bound the mint: it is the only network hop in this signer and runs on
+	// the proxied request's context, which typically carries no deadline —
+	// a hung or mid-response-stalled SSO portal would otherwise wedge the
+	// cluster request for as long as the agent holds the connection (the
+	// default SDK retryer only makes that worse). The account/role are
+	// already named by the minter's own error wrap, so this call site drops
+	// the pair to avoid a doubled "A/R … A/R" chain.
+	mintCtx, cancel := context.WithTimeout(ctx, ssoMintTimeout)
+	defer cancel()
+	creds, err := c.minterFor(token).credentials(mintCtx, account, role)
 	if err != nil {
-		return fmt.Errorf("aws_sso_eks_credential: exchange SSO token for %s/%s role credentials "+
-			"(reconnect AWS SSO if the session has expired): %w", account, role, err)
+		return fmt.Errorf("aws_sso_eks_credential: exchange SSO token for role credentials "+
+			"(reconnect AWS SSO if the session has expired): %w", err)
 	}
 
 	// Feed the temporary creds into the same STS-presign EKS-bearer path
-	// aws_credential uses. Note the two regions: the presign is scoped to
-	// the endpoint's cluster/STS region, not the credential's SSO region.
-	bearer, err := mintEKSBearerToken(ctx, creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken, region, cluster)
+	// aws_credential uses, tagged with this credential's provenance so a
+	// presign failure logs against aws_sso_eks_credential rather than
+	// aws_credential. Note the two regions: the presign is scoped to the
+	// endpoint's cluster/STS region, not the credential's SSO region. This
+	// presign is local computation, so it is deliberately left on ctx.
+	bearer, err := mintEKSBearerToken(ctx, "aws_sso_eks_credential", creds.AccessKeyID, creds.SecretAccessKey, creds.SessionToken, region, cluster)
 	if err != nil {
 		return err
 	}

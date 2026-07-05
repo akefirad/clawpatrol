@@ -9,6 +9,13 @@ package credentials
 // clawpatrol-plugin-aws minter (internal/awssso/minter.go), minus the
 // brokered-dial seam — core is not sandboxed, so the SSO client dials
 // the portal directly instead of routing through the gateway.
+//
+// SYNC OBLIGATION: this is one of two intentional copies of a
+// security-sensitive minter. The other is
+// clawpatrol-plugin-aws/internal/awssso/minter.go. They are not shared
+// code, and nothing forces them to stay in sync. Any hardening to the
+// mint/retrieve path (e.g. fail-closed validation of the SSO response)
+// MUST be mirrored in the sibling copy, and vice versa.
 
 import (
 	"context"
@@ -144,10 +151,22 @@ func (p *ssoRoleProvider) Retrieve(ctx context.Context) (aws.Credentials, error)
 	if rc.Expiration <= 0 {
 		return aws.Credentials{}, fmt.Errorf("sso GetRoleCredentials: non-positive expiration %d", rc.Expiration)
 	}
+	// Fail closed on empty credential material: a malformed-but-200 response
+	// (roleCredentials present, valid expiration, but empty key material —
+	// aws.ToString(nil) → "") would otherwise be cached until expiry,
+	// signing every request with empty keys and producing garbage bearers
+	// with no re-mint until the window opens. SSO role credentials are
+	// always session credentials, so all three must be non-empty.
+	akid := aws.ToString(rc.AccessKeyId)
+	secret := aws.ToString(rc.SecretAccessKey)
+	sessionToken := aws.ToString(rc.SessionToken)
+	if akid == "" || secret == "" || sessionToken == "" {
+		return aws.Credentials{}, errors.New("sso GetRoleCredentials: empty credential material (missing access key, secret, or session token)")
+	}
 	return aws.Credentials{
-		AccessKeyID:     aws.ToString(rc.AccessKeyId),
-		SecretAccessKey: aws.ToString(rc.SecretAccessKey),
-		SessionToken:    aws.ToString(rc.SessionToken),
+		AccessKeyID:     akid,
+		SecretAccessKey: secret,
+		SessionToken:    sessionToken,
 		Source:          "aws_sso GetRoleCredentials",
 		AccountID:       p.account,
 		CanExpire:       true,
