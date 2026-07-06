@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
+	ssooidctypes "github.com/aws/aws-sdk-go-v2/service/ssooidc/types"
 
 	"github.com/denoland/clawpatrol/internal/config"
 )
@@ -65,6 +67,13 @@ func awsSSOMockServer(t *testing.T, tokenHandler http.HandlerFunc) *httptest.Ser
 		srv.Close()
 	})
 	return srv
+}
+
+// awsSSOTestVerifier builds the JSON-encoded session payload the poll step
+// decodes, matching what startAWSSSODeviceFlow stashes.
+func awsSSOTestVerifier() string {
+	b, _ := json.Marshal(awsSSODeviceSession{ClientID: "cid", ClientSecret: "csec", DeviceCode: "dc", Region: "us-east-1"})
+	return string(b)
 }
 
 func newAWSSSOTestMux() (*webMux, *OAuthRegistry) {
@@ -167,14 +176,45 @@ func TestStartAWSSSODeviceFlow(t *testing.T) {
 		t.Errorf("verification_uri = %q, want the complete verification URI", out.VerificationURI)
 	}
 	// The session must carry client id/secret, device code, and region so
-	// the poll step can complete CreateToken.
+	// the poll step can complete CreateToken — JSON-encoded in verifier.
 	sess := w.sessions[out.State]
 	if sess == nil {
 		t.Fatal("no session stashed for the returned state")
 	}
-	if parts := strings.Split(sess.verifier, "|"); len(parts) != 4 ||
-		parts[0] != "cid" || parts[2] != "dc" || parts[3] != "us-east-1" {
-		t.Errorf("session verifier = %q, want cid|csec|dc|us-east-1 shape", sess.verifier)
+	var sd awsSSODeviceSession
+	if err := json.Unmarshal([]byte(sess.verifier), &sd); err != nil {
+		t.Fatalf("session verifier is not valid JSON: %v (%q)", err, sess.verifier)
+	}
+	if sd.ClientID != "cid" || sd.ClientSecret != "csec" || sd.DeviceCode != "dc" || sd.Region != "us-east-1" {
+		t.Errorf("session data = %+v, want {cid csec dc us-east-1}", sd)
+	}
+}
+
+// TestAWSSSOSessionRoundTripsPipeInSecret guards the JSON encoding of the
+// session fields (replacing the old pipe-join): AWS returns an opaque
+// clientSecret / deviceCode whose charset is undocumented, so a literal '|'
+// in any earlier field must round-trip intact. The old strings.SplitN(…,"|",4)
+// packing would have folded such a '|' forward, corrupting the device code /
+// region; the JSON codec must not. Encodes exactly as startAWSSSODeviceFlow
+// does and decodes exactly as pollAWSSSODeviceFlow does.
+func TestAWSSSOSessionRoundTripsPipeInSecret(t *testing.T) {
+	want := awsSSODeviceSession{
+		ClientID:     "ci|d",
+		ClientSecret: "cs|ec|ret",
+		DeviceCode:   "dc|1|2",
+		Region:       "us-east-1",
+	}
+	verifier, err := json.Marshal(want)
+	if err != nil {
+		t.Fatalf("encode session: %v", err)
+	}
+
+	var got awsSSODeviceSession
+	if err := json.Unmarshal(verifier, &got); err != nil {
+		t.Fatalf("decode session: %v (%q)", err, verifier)
+	}
+	if got != want {
+		t.Errorf("pipe-containing fields corrupted on round-trip: got %+v, want %+v", got, want)
 	}
 }
 
@@ -253,7 +293,7 @@ func TestPollAWSSSODeviceFlowSuccess(t *testing.T) {
 		})
 	})
 	w, reg := newAWSSSOTestMux()
-	w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: "cid|csec|dc|us-east-1"}
+	w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: awsSSOTestVerifier()}
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/oauth/device-poll?state=st", nil)
@@ -303,7 +343,7 @@ func TestPollAWSSSODeviceFlowPending(t *testing.T) {
 		_, _ = w.Write([]byte(`{"__type":"AuthorizationPendingException","message":"pending"}`))
 	})
 	w, reg := newAWSSSOTestMux()
-	w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: "cid|csec|dc|us-east-1"}
+	w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: awsSSOTestVerifier()}
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/oauth/device-poll?state=st", nil)
@@ -342,7 +382,7 @@ func TestPollAWSSSODeviceFlowTerminalErrors(t *testing.T) {
 				_, _ = w.Write([]byte(`{"__type":"` + tc.errType + `","message":"terminal"}`))
 			})
 			w, reg := newAWSSSOTestMux()
-			w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: "cid|csec|dc|us-east-1"}
+			w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: awsSSOTestVerifier()}
 
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest("POST", "/api/oauth/device-poll?state=st", nil)
@@ -375,7 +415,7 @@ func TestPollAWSSSODeviceFlowTransientKeepsSession(t *testing.T) {
 		_, _ = w.Write([]byte(`{"__type":"InternalServerException","message":"transient"}`))
 	})
 	w, reg := newAWSSSOTestMux()
-	w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: "cid|csec|dc|us-east-1"}
+	w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: awsSSOTestVerifier()}
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest("POST", "/api/oauth/device-poll?state=st", nil)
@@ -390,5 +430,60 @@ func TestPollAWSSSODeviceFlowTransientKeepsSession(t *testing.T) {
 	// The session MUST survive so the next poll tick can recover.
 	if _, ok := w.sessions["st"]; !ok {
 		t.Error("session deleted on a transient error; the device login can no longer recover")
+	}
+}
+
+// TestIsRetryableCreateTokenErrTerminalBeatsCancel pins the terminal-first
+// classification: a terminal ssooidc error arriving on the same tick the
+// request ctx is cancelled must be classified terminal (not retryable), so the
+// dead session is deleted immediately rather than lingering until GC. A bare
+// ctx cancel with no terminal error stays transient.
+func TestIsRetryableCreateTokenErrTerminalBeatsCancel(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // ctx.Err() != nil, as if the browser navigated away mid-poll
+
+	terminals := map[string]error{
+		"access denied": &ssooidctypes.AccessDeniedException{},
+		"expired token": &ssooidctypes.ExpiredTokenException{},
+		"unauthorized":  &ssooidctypes.UnauthorizedClientException{},
+	}
+	for name, err := range terminals {
+		if isRetryableCreateTokenErr(ctx, err) {
+			t.Errorf("%s on a cancelled ctx classified as retryable; want terminal (not retryable)", name)
+		}
+	}
+	// A plain ctx cancel with no terminal error remains transient.
+	if !isRetryableCreateTokenErr(ctx, context.Canceled) {
+		t.Error("a plain ctx cancel should remain transient (retryable)")
+	}
+}
+
+// TestPollAWSSSODeviceFlowEmptyAccessToken exercises the empty-access-token
+// guard: a CreateToken success (err==nil) carrying no access token is an
+// upstream anomaly and must be treated as pending — never persisted as a
+// credential, never reported connected — so the dashboard keeps polling.
+func TestPollAWSSSODeviceFlowEmptyAccessToken(t *testing.T) {
+	awsSSOMockServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		// 200 success, but no accessToken field.
+		writeJSON(w, map[string]any{"tokenType": "Bearer", "expiresIn": 3600})
+	})
+	w, reg := newAWSSSOTestMux()
+	w.sessions["st"] = &oauthSession{state: "st", id: "sso", verifier: awsSSOTestVerifier()}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("POST", "/api/oauth/device-poll?state=st", nil)
+	w.pollAWSSSODeviceFlow(rec, req, w.sessions["st"])
+
+	var out map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &out)
+	if out["error"] != "authorization_pending" {
+		t.Errorf("response = %v, want error=authorization_pending for an empty-access-token success", out)
+	}
+	if connected, _ := reg.Status("sso"); connected {
+		t.Error("registry shows connected on an empty-token success — must not persist an empty credential")
+	}
+	// The session must survive so polling can continue.
+	if _, ok := w.sessions["st"]; !ok {
+		t.Error("session deleted on an empty-token success; polling can no longer continue")
 	}
 }
