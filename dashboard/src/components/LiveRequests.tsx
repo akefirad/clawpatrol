@@ -19,6 +19,63 @@ function isQuietDial(ev: EventRecord): boolean {
   return ev.method === "dial" && !isDeniedAction(ev);
 }
 
+// A collapsed display group: a run of consecutive rows that render
+// identically (same family/host/verb/body/status), folded into one
+// line with a ×N counter. `rep` is the newest member (the list is
+// newest-first, so it's the head of the run); `count` is the run
+// length.
+type RowGroup = { rep: RowState; count: number };
+
+// isCollapsible gates which rows are allowed to fold into a run. Only
+// "quiet" completed rows collapse — anything that renders its own
+// detail block (in-flight, WS frames, denied, approved-by, awaiting
+// approval) always shows in full so nothing security-interesting hides
+// behind a counter.
+function isCollapsible(ev: RowState): boolean {
+  if (ev.phase === "start") return false;
+  if ((ev.frames?.length ?? 0) > 0) return false;
+  if (isDeniedAction(ev)) return false;
+  if (ev.action === "approved" || ev.action === "hitl_allow") return false;
+  if (ev.action === "hitl_pending") return false;
+  return true;
+}
+
+// rowSignature is the collapse key: two rows fold together iff they
+// would render the same leading verb, host+body, and status. Reusing
+// rowDescriptors means the rule is simply "rows that look identical
+// collapse" — no separate notion of sameness to keep in sync.
+function rowSignature(ev: RowState, byFamily: Record<string, FacetSchema>): string {
+  const schema = ev.family ? byFamily[ev.family] : undefined;
+  const { verb, body } = rowDescriptors(ev, schema);
+  return [ev.family ?? "", ev.host, verb, body, ev.status ?? "", ev.mode ?? ""].join("\n");
+}
+
+// collapseRuns folds consecutive collapsible rows with the same
+// signature into a single RowGroup (browser-console style). A row that
+// isn't collapsible, or whose signature differs from the current run,
+// starts a fresh group — so an interleaved sendMessage between two
+// bursts of getUpdates keeps them as two separate groups and preserves
+// the timeline.
+function collapseRuns(rows: RowState[], byFamily: Record<string, FacetSchema>): RowGroup[] {
+  const groups: RowGroup[] = [];
+  let lastKey = "";
+  for (const ev of rows) {
+    const last = groups[groups.length - 1];
+    if (
+      last &&
+      isCollapsible(ev) &&
+      isCollapsible(last.rep) &&
+      rowSignature(ev, byFamily) === lastKey
+    ) {
+      last.count += 1;
+      continue;
+    }
+    lastKey = rowSignature(ev, byFamily);
+    groups.push({ rep: ev, count: 1 });
+  }
+  return groups;
+}
+
 export function LiveRequests({
   agentIP,
   max = 200,
@@ -91,6 +148,10 @@ export function LiveRequests({
 
   const hiddenDials = events.reduce((n, e) => n + (isQuietDial(e) ? 1 : 0), 0);
   const shown = showDials ? events : events.filter((e) => !isQuietDial(e));
+  // Fold consecutive identical rows (e.g. a burst of Telegram
+  // getUpdates polls) into one ×N line so a chatty endpoint can't
+  // drown the log. Display-only: the raw `events` buffer is untouched.
+  const groups = collapseRuns(shown, byFamily);
 
   return (
     <div
@@ -122,8 +183,13 @@ export function LiveRequests({
             <AnimatedDots />
           </div>
         ) : (
-          shown.map((e, i) => (
-            <Row key={i} ev={e} schema={e.family ? byFamily[e.family] : undefined} />
+          groups.map((g, i) => (
+            <Row
+              key={i}
+              ev={g.rep}
+              count={g.count}
+              schema={g.rep.family ? byFamily[g.rep.family] : undefined}
+            />
           ))
         )}
       </div>
@@ -216,7 +282,15 @@ export function rowDescriptors(
   return { verb: ev.method ?? "", body: ev.path ?? "" };
 }
 
-function Row({ ev, schema }: { ev: RowState; schema: FacetSchema | undefined }) {
+function Row({
+  ev,
+  schema,
+  count = 1,
+}: {
+  ev: RowState;
+  schema: FacetSchema | undefined;
+  count?: number;
+}) {
   const onClick = ev.id
     ? () => {
         window.location.hash = `#/request/${ev.id}`;
@@ -266,6 +340,14 @@ function Row({ ev, schema }: { ev: RowState; schema: FacetSchema | undefined }) 
           {sep && <span> </span>}
           <span>{body}</span>
         </span>
+        {count > 1 && (
+          <span
+            className="text-2xs tabular-nums font-mono font-semibold text-text-muted bg-navy-100 border border-navy/20 rounded px-1 shrink-0"
+            title={`${count} identical requests collapsed`}
+          >
+            ×{count}
+          </span>
+        )}
         <span className="text-2xs tabular-nums text-text-subtle shrink-0">
           {inFlight ? "…" : ev.ms + "ms"}
         </span>
