@@ -1,10 +1,14 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { type EventRecord, type FacetSchema } from "../lib/api";
 import { formatFacetValue, useFacets } from "../lib/facets";
 import { fmtTime, statusColorClass } from "../lib/format";
 
 type RowState = EventRecord & {
   frames?: { direction: string; frame: string; ts: string }[];
+  // repeat is the number of coalesced occurrences this row stands for
+  // (see coalesceAdjacent). Absent/1 for an ordinary single event; the
+  // row carries the newest occurrence's timestamp/status/ms.
+  repeat?: number;
 };
 
 function isDeniedAction(ev: EventRecord): boolean {
@@ -17,6 +21,63 @@ function isDeniedAction(ev: EventRecord): boolean {
 // denied dial is a blocked egress and is never hidden.
 function isQuietDial(ev: EventRecord): boolean {
   return ev.method === "dial" && !isDeniedAction(ev);
+}
+
+// isCollapsible gates which rows are allowed to fold into a run. Only
+// "quiet" completed rows collapse — anything that renders its own
+// detail block (in-flight, WS frames, denied, approved-by, awaiting
+// approval) always shows in full so nothing security-interesting hides
+// behind a counter.
+function isCollapsible(ev: RowState): boolean {
+  if (ev.phase === "start") return false;
+  if ((ev.frames?.length ?? 0) > 0) return false;
+  if (isDeniedAction(ev)) return false;
+  if (ev.action === "approved" || ev.action === "hitl_allow") return false;
+  if (ev.action === "hitl_pending") return false;
+  return true;
+}
+
+// rowSignature is the collapse key: two rows fold together iff they
+// would render the same leading verb, host+body, and status. Reusing
+// rowDescriptors means the rule is simply "rows that look identical
+// collapse" — no separate notion of sameness to keep in sync.
+function rowSignature(ev: RowState, byFamily: Record<string, FacetSchema>): string {
+  const schema = ev.family ? byFamily[ev.family] : undefined;
+  const { verb, body } = rowDescriptors(ev, schema);
+  return [ev.family ?? "", ev.host, verb, body, ev.status ?? "", ev.mode ?? ""].join("\n");
+}
+
+// coalesceAdjacent folds consecutive collapsible rows with the same
+// signature into a single row carrying a `repeat` count (browser-console
+// style). Applied to the buffer on every merge so a chatty endpoint (a
+// burst of Telegram getUpdates polls) occupies ONE slot instead of
+// evicting distinct events under the `max` cap. The kept row is the
+// newest occurrence (the list is newest-first, so it's the head of the
+// run); its repeat accumulates the occurrences it stands for.
+//
+// A row that isn't collapsible, or whose signature differs from the
+// current run, breaks the run — so an interleaved distinct request (a
+// sendMessage between two bursts of getUpdates) keeps them as two rows
+// and preserves the timeline. Only completed rows coalesce (isCollapsible
+// excludes in-flight/frames/denied/approved/pending), so this never
+// disturbs the id-correlated start/end/frame bookkeeping in mergeEvent.
+function coalesceAdjacent(rows: RowState[], byFamily: Record<string, FacetSchema>): RowState[] {
+  const out: RowState[] = [];
+  let lastSig = "";
+  for (const ev of rows) {
+    const prev = out[out.length - 1];
+    const sig = rowSignature(ev, byFamily);
+    if (prev && isCollapsible(ev) && isCollapsible(prev) && sig === lastSig) {
+      // Keep prev (the newer occurrence, already at the head) and roll
+      // ev's count into it. Clone so we never mutate a row still held by
+      // the previous React state.
+      out[out.length - 1] = { ...prev, repeat: (prev.repeat ?? 1) + (ev.repeat ?? 1) };
+      continue;
+    }
+    out.push(ev);
+    lastSig = sig;
+  }
+  return out;
 }
 
 export function LiveRequests({
@@ -35,6 +96,12 @@ export function LiveRequests({
   // real egress block and always show (isQuietDial excludes them).
   const [showDials, setShowDials] = useState(false);
   const { byFamily } = useFacets();
+  // coalesceAdjacent runs inside the setEvents updaters, which are
+  // created once by the effect below; a ref keeps them reading the
+  // latest facet schema (it loads async after mount) without re-running
+  // the effect and tearing down the SSE connection.
+  const byFamilyRef = useRef(byFamily);
+  byFamilyRef.current = byFamily;
 
   useEffect(() => {
     setEvents([]);
@@ -56,8 +123,10 @@ export function LiveRequests({
       pending = [];
       setEvents((prev) => {
         let next = prev;
-        for (const ev of batch) next = mergeEvent(next, ev, max);
-        return next;
+        for (const ev of batch) next = mergeEvent(next, ev);
+        // Coalesce identical runs, THEN cap: the cap counts distinct
+        // rows, so a flood of repeats can't evict distinct events.
+        return coalesceAdjacent(next, byFamilyRef.current).slice(0, max);
       });
     };
     // Backlog ships as one event up front: bulk-insert in a single
@@ -68,8 +137,8 @@ export function LiveRequests({
         const arr = JSON.parse((e as MessageEvent).data) as EventRecord[];
         setEvents((prev) => {
           let next = prev;
-          for (const ev of arr) next = mergeEvent(next, ev, max);
-          return next;
+          for (const ev of arr) next = mergeEvent(next, ev);
+          return coalesceAdjacent(next, byFamilyRef.current).slice(0, max);
         });
       } catch {
         /* ignore */
@@ -91,6 +160,10 @@ export function LiveRequests({
 
   const hiddenDials = events.reduce((n, e) => n + (isQuietDial(e) ? 1 : 0), 0);
   const shown = showDials ? events : events.filter((e) => !isQuietDial(e));
+  // Rows are already coalesced in the buffer (see coalesceAdjacent), so
+  // each carries a `repeat`. Sum them for the header so the count still
+  // reads as total requests seen, not collapsed rows.
+  const shownTotal = shown.reduce((n, e) => n + (e.repeat ?? 1), 0);
 
   return (
     <div
@@ -101,7 +174,7 @@ export function LiveRequests({
         <span>Live requests</span>
         <span className="ml-2 text-success-500 tabular-nums flex items-center gap-1">
           <span className="w-1.5 h-1.5 rounded-full bg-success-500 animate-pulse" />
-          {shown.length}
+          {shownTotal}
         </span>
         {hiddenDials > 0 && (
           <button
@@ -123,7 +196,12 @@ export function LiveRequests({
           </div>
         ) : (
           shown.map((e, i) => (
-            <Row key={i} ev={e} schema={e.family ? byFamily[e.family] : undefined} />
+            <Row
+              key={i}
+              ev={e}
+              count={e.repeat ?? 1}
+              schema={e.family ? byFamily[e.family] : undefined}
+            />
           ))
         )}
       </div>
@@ -139,7 +217,11 @@ export function LiveRequests({
 //   - phase="frame" with id  → append a frame to the matching row's
 //                              `frames` list, no row reorder.
 //   - phase undefined / no id → legacy/non-correlated event, prepend.
-function mergeEvent(prev: RowState[], ev: EventRecord, max: number): RowState[] {
+//
+// Never truncates: the caller coalesces the result and applies the
+// `max` cap afterwards, so a run of repeats collapses to one row before
+// the cap counts it (otherwise a flood would evict distinct events).
+function mergeEvent(prev: RowState[], ev: EventRecord): RowState[] {
   if (ev.id && ev.phase === "frame") {
     return prev.map((r) =>
       r.id === ev.id
@@ -165,13 +247,13 @@ function mergeEvent(prev: RowState[], ev: EventRecord, max: number): RowState[] 
       return { ...ev, frames: r.frames };
     });
     if (found) return next;
-    return [ev, ...prev].slice(0, max);
+    return [ev, ...prev];
   }
   if (ev.id && ev.phase === "start") {
     if (prev.some((r) => r.id === ev.id)) return prev;
-    return [ev, ...prev].slice(0, max);
+    return [ev, ...prev];
   }
-  return [ev, ...prev].slice(0, max);
+  return [ev, ...prev];
 }
 
 // rowDescriptors picks the short labels shown per event:
@@ -216,7 +298,15 @@ export function rowDescriptors(
   return { verb: ev.method ?? "", body: ev.path ?? "" };
 }
 
-function Row({ ev, schema }: { ev: RowState; schema: FacetSchema | undefined }) {
+function Row({
+  ev,
+  schema,
+  count = 1,
+}: {
+  ev: RowState;
+  schema: FacetSchema | undefined;
+  count?: number;
+}) {
   const onClick = ev.id
     ? () => {
         window.location.hash = `#/request/${ev.id}`;
@@ -266,6 +356,14 @@ function Row({ ev, schema }: { ev: RowState; schema: FacetSchema | undefined }) 
           {sep && <span> </span>}
           <span>{body}</span>
         </span>
+        {count > 1 && (
+          <span
+            className="text-2xs tabular-nums font-mono font-semibold text-text-muted bg-navy-100 border border-navy/20 rounded px-1 shrink-0"
+            title={`${count} identical requests collapsed`}
+          >
+            ×{count}
+          </span>
+        )}
         <span className="text-2xs tabular-nums text-text-subtle shrink-0">
           {inFlight ? "…" : ev.ms + "ms"}
         </span>
