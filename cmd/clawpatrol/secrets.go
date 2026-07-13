@@ -252,6 +252,10 @@ func registerOAuthCredentials(reg *OAuthRegistry, policy *config.CompiledPolicy)
 		copied.ID = name
 		reg.Register(name, copied)
 	}
+	// Wire session-referencing credentials (aws_sso_eks_credential with
+	// `session = "<owner>"`) to the credential owning their SSO login, so
+	// they reuse that token instead of prompting a second device login.
+	registerSSOSessionAliases(reg, policy)
 	if err := reg.LoadFromDB(); err != nil {
 		log.Printf("oauth: rehydrate from db: %v", err)
 	}

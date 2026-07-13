@@ -72,13 +72,21 @@ type OAuthRegistry struct {
 	mu           sync.RWMutex
 	integrations map[string]*OAuthIntegration
 	states       map[string]*oauthState // key: id
-	db           *sql.DB
+	// aliases maps a credential id to the id of another credential that
+	// owns its OAuth session. A session-referencing credential (see
+	// registerSSOSessionAliases) has no state of its own; token/status
+	// reads for it fall through to the owner's session so one device
+	// login serves both. Read-only paths only — Set/Revoke never follow
+	// an alias, so revoking the borrower can't delete the owner's token.
+	aliases map[string]string
+	db      *sql.DB
 }
 
 func NewOAuthRegistry(items []OAuthIntegration, db *sql.DB) (*OAuthRegistry, error) {
 	r := &OAuthRegistry{
 		integrations: map[string]*OAuthIntegration{},
 		states:       map[string]*oauthState{},
+		aliases:      map[string]string{},
 		db:           db,
 	}
 	for i := range items {
@@ -110,6 +118,44 @@ func (r *OAuthRegistry) get(id string) *oauthState {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.states[id]
+}
+
+// SetAlias records that credential id reuses the OAuth session owned by
+// credential source (see registerSSOSessionAliases). Read paths (Token,
+// Status) fall through to source when id has no state of its own.
+func (r *OAuthRegistry) SetAlias(id, source string) {
+	if id == "" || source == "" {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.aliases == nil {
+		r.aliases = map[string]string{}
+	}
+	r.aliases[id] = source
+}
+
+// aliasOf returns the session-owner id for a session-referencing
+// credential, or "" if id owns its own session.
+func (r *OAuthRegistry) aliasOf(id string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.aliases[id]
+}
+
+// stateOrAlias returns id's own state, or — when id has none — the state
+// of the credential it borrows its session from. Used by the read paths
+// that a session-referencing credential must see through (Token/Status);
+// separate lock/unlock cycles (never nested) keep the RWMutex safe.
+func (r *OAuthRegistry) stateOrAlias(id string) *oauthState {
+	s := r.get(id)
+	if s != nil && s.source != nil {
+		return s
+	}
+	if alias := r.aliasOf(id); alias != "" {
+		return r.get(alias)
+	}
+	return s
 }
 
 // Inject sets the auth header on req using the named credential.
@@ -145,7 +191,7 @@ func (r *OAuthRegistry) Token(id string) (string, error) {
 	if id == "" {
 		return "", nil
 	}
-	s := r.get(id)
+	s := r.stateOrAlias(id)
 	if s == nil || s.source == nil {
 		return "", nil
 	}
@@ -173,7 +219,7 @@ func (r *OAuthRegistry) Register(id string, def OAuthIntegration) {
 
 // Status returns connected info for the named credential.
 func (r *OAuthRegistry) Status(id string) (connected bool, expiry time.Time) {
-	s := r.get(id)
+	s := r.stateOrAlias(id)
 	if s == nil || s.source == nil {
 		return false, time.Time{}
 	}

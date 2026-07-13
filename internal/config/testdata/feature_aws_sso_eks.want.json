@@ -15,9 +15,19 @@
       "corp-sso": {
         "body": {
           "StartURL": "https://my-org.awsapps.com/start",
-          "Region": "eu-central-1"
+          "Region": "eu-central-1",
+          "Session": ""
         },
         "endpoint": "eks-corp-prod",
+        "type": "aws_sso_eks_credential"
+      },
+      "staging-sso": {
+        "body": {
+          "StartURL": "",
+          "Region": "eu-central-1",
+          "Session": "corp-sso"
+        },
+        "endpoint": "eks-corp-staging",
         "type": "aws_sso_eks_credential"
       }
     },
@@ -36,12 +46,28 @@
         },
         "family": "k8s",
         "type": "kubernetes"
+      },
+      "eks-corp-staging": {
+        "body": {
+          "Hosts": [
+            "*.gr7.us-west-2.eks.amazonaws.com"
+          ],
+          "Server": "",
+          "CACert": "",
+          "ClusterName": "corp-staging",
+          "Region": "us-west-2",
+          "AccountID": "210987654321",
+          "RoleName": "EKSReadOnly"
+        },
+        "family": "k8s",
+        "type": "kubernetes"
       }
     },
     "profiles": {
       "default": {
         "credentials": [
-          "corp-sso"
+          "corp-sso",
+          "staging-sso"
         ]
       }
     },
@@ -62,6 +88,27 @@
           "family": "k8s",
           "endpoints": [
             "eks-corp-prod"
+          ],
+          "condition": "k8s.verb in ['get', 'list', 'watch']",
+          "verdict": "allow"
+        }
+      },
+      "eks-staging-default": {
+        "body": {
+          "name": "eks-staging-default",
+          "family": "k8s",
+          "endpoints": [
+            "eks-corp-staging"
+          ],
+          "verdict": "deny"
+        }
+      },
+      "eks-staging-reads": {
+        "body": {
+          "name": "eks-staging-reads",
+          "family": "k8s",
+          "endpoints": [
+            "eks-corp-staging"
           ],
           "condition": "k8s.verb in ['get', 'list', 'watch']",
           "verdict": "allow"

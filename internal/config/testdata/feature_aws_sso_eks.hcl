@@ -4,6 +4,12 @@
 # (account_id, role_name). Pins the required-attr load (start_url,
 # region) and the Emit round-trip of the new endpoint fields with
 # NON-empty values.
+#
+# Also pins the session-reuse path: a second EKS credential sets
+# `session = "corp-sso"` (instead of start_url) to reuse the first
+# credential's AWS SSO login rather than prompting a second device
+# login. This covers the nil-OAuthFlow branch, the session Emit
+# round-trip, and the session-only load (no start_url).
 
 gateway {
   state_dir  = "/opt/clawpatrol"
@@ -40,6 +46,25 @@ credential "aws_sso_eks_credential" "corp-sso" {
   region    = "eu-central-1"
 }
 
+# A second EKS cluster in a different account/role, reached with the SAME
+# AWS SSO login as corp-sso.
+endpoint "kubernetes" "eks-corp-staging" {
+  hosts        = ["*.gr7.us-west-2.eks.amazonaws.com"]
+  cluster_name = "corp-staging"
+  region       = "us-west-2"
+  account_id   = "210987654321"
+  role_name    = "EKSReadOnly"
+}
+
+# Session reuse: no start_url of its own — `session` names corp-sso, so
+# this credential borrows corp-sso's SSO session (one device login serves
+# both). region is still required (it scopes sso:GetRoleCredentials).
+credential "aws_sso_eks_credential" "staging-sso" {
+  endpoint = kubernetes.eks-corp-staging
+  session  = "corp-sso"
+  region   = "eu-central-1"
+}
+
 rule "eks-reads" {
   endpoint  = kubernetes.eks-corp-prod
   condition = "k8s.verb in ['get', 'list', 'watch']"
@@ -51,6 +76,20 @@ rule "eks-default" {
   verdict  = "deny"
 }
 
+rule "eks-staging-reads" {
+  endpoint  = kubernetes.eks-corp-staging
+  condition = "k8s.verb in ['get', 'list', 'watch']"
+  verdict   = "allow"
+}
+
+rule "eks-staging-default" {
+  endpoint = kubernetes.eks-corp-staging
+  verdict  = "deny"
+}
+
 profile "default" {
-  credentials = [aws_sso_eks_credential.corp-sso]
+  credentials = [
+    aws_sso_eks_credential.corp-sso,
+    aws_sso_eks_credential.staging-sso,
+  ]
 }

@@ -201,6 +201,50 @@ func TestFetchOAuthProfileRespectsContextCancellation(t *testing.T) {
 	}
 }
 
+// TestOAuthRegistryAliasReusesOwnerSession covers the session-reuse
+// alias path: a credential with no session of its own (an
+// aws_sso_eks_credential declaring `session = "aws-sso"`) resolves its
+// token and status through the owner's session, so one AWS SSO device
+// login serves both. Revoking the borrower must not touch the owner.
+func TestOAuthRegistryAliasReusesOwnerSession(t *testing.T) {
+	reg, err := NewOAuthRegistry([]OAuthIntegration{{ID: "aws-sso", Flow: "aws_sso"}}, nil)
+	if err != nil {
+		t.Fatalf("new registry: %v", err)
+	}
+	// The borrower owns no integration; it reuses aws-sso's session.
+	reg.SetAlias("aws-eks", "aws-sso")
+
+	// Before the owner logs in, the borrower resolves to no token and
+	// reads as disconnected (fail-closed: no session to borrow yet).
+	if tok, err := reg.Token("aws-eks"); err != nil || tok != "" {
+		t.Fatalf("pre-login Token(aws-eks) = %q, %v; want empty, nil", tok, err)
+	}
+	if connected, _ := reg.Status("aws-eks"); connected {
+		t.Errorf("Status(aws-eks) connected before the owner logged in")
+	}
+
+	// Owner completes the device login.
+	if err := reg.Set(context.Background(), "aws-sso",
+		&oauth2.Token{AccessToken: "sso-tok", Expiry: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatalf("set owner token: %v", err)
+	}
+
+	// The borrower now resolves to the owner's token — no second login.
+	if tok, err := reg.Token("aws-eks"); err != nil || tok != "sso-tok" {
+		t.Fatalf("Token(aws-eks) = %q, %v; want sso-tok, nil", tok, err)
+	}
+	if connected, _ := reg.Status("aws-eks"); !connected {
+		t.Errorf("Status(aws-eks) not connected after the owner logged in")
+	}
+
+	// Revoking the borrower must leave the owner's session intact:
+	// Set/Revoke never follow the alias.
+	reg.Revoke("aws-eks")
+	if tok, err := reg.Token("aws-sso"); err != nil || tok != "sso-tok" {
+		t.Fatalf("owner Token after borrower revoke = %q, %v; want sso-tok intact", tok, err)
+	}
+}
+
 func contains(s, sub string) bool {
 	for i := 0; i+len(sub) <= len(s); i++ {
 		if s[i:i+len(sub)] == sub {

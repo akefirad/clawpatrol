@@ -706,8 +706,13 @@ func (w *webMux) statusList(r *http.Request) []IntegrationRow {
 		ent := policy.Credentials[name]
 		row := IntegrationRow{ID: name, Name: name, Type: ent.Plugin.Type}
 		if op, ok := ent.Body.(config.OAuthFlowProvider); ok {
-			row.HasOAuth = true
+			// Only advertise a Connect affordance when the credential
+			// actually runs an OAuth flow. A session-referencing credential
+			// (aws_sso_eks_credential with `session`) returns a nil flow: it
+			// reuses another credential's login, so it gets no Connect card —
+			// but Status still reports Connected via the shared session below.
 			if flow := op.OAuthFlow(); flow != nil {
+				row.HasOAuth = true
 				row.OAuth = &OAuthIntegrationUI{
 					BaseScopes:     flow.OAuth.Scopes,
 					OptionalScopes: flow.OptionalScopes,

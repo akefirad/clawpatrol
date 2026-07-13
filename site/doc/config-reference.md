@@ -226,14 +226,21 @@ start URL is the SSO access-portal URL, and Region is the SSO portal
 region. There is no secret slot — the SSO access token is delivered as
 the runtime Secret by the core OAuth device flow.
 
+Session is the session-reuse alternative to StartURL: set it (instead
+of start_url) to the bare name of another AWS SSO credential and this
+credential borrows that credential's SSO login rather than prompting a
+second AWS SSO device login. The host resolves the borrowed token via
+OAuthSessionSource + the OAuthRegistry alias path; Region is still
+required either way (it scopes sso:GetRoleCredentials).
+
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `start_url` | `string` | yes | The AWS SSO access-portal start URL, e.g. https://my-org.awsapps.com/start. |
+| `start_url` | `string` | no | The AWS SSO access-portal start URL, e.g. https://my-org.awsapps.com/start. Empty when Session is set (this credential then reuses another credential's login and needs no start URL of its own). |
 | `region` | `string` | yes | The SSO portal region — where GetRoleCredentials is called. Independent of the cluster/STS region on the endpoint. |
+| `session` | `string` | no | Session, when set, is the bare name of the AWS SSO credential whose device login this credential reuses. Mutually exclusive with StartURL: with Session set this credential runs no OAuth flow of its own (OAuthFlow returns nil, so the dashboard shows no Connect card) and its SSO access token resolves to the named credential's session. |
 
 ```hcl
 credential "aws_sso_eks_credential" "example" {
-  start_url = "example"
   region = "example"
 }
 ```

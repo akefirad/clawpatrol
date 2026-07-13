@@ -15,7 +15,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sso"
+	"github.com/hashicorp/hcl/v2"
 
+	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/plugins/endpoints"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
@@ -323,6 +325,65 @@ func TestAWSSSOEKSCredentialOAuthFlow(t *testing.T) {
 	}
 	if flow.OAuth.DeviceURL != cred.Region {
 		t.Errorf("DeviceURL = %q, want %q (SSO region)", flow.OAuth.DeviceURL, cred.Region)
+	}
+}
+
+// TestAWSSSOEKSCredentialSessionReuseSuppressesOwnFlow asserts the
+// session-reuse seam: when `session` names another credential, this
+// credential runs no OAuth flow of its own (OAuthFlow == nil, so the
+// dashboard shows no second Connect card) and OAuthSessionSource surfaces
+// the owner the host aliases its token to. With no session it runs its
+// own flow as before.
+func TestAWSSSOEKSCredentialSessionReuseSuppressesOwnFlow(t *testing.T) {
+	reuse := &AWSSSOEKSCredential{Session: "aws-sso", Region: "eu-central-1"}
+	if flow := reuse.OAuthFlow(); flow != nil {
+		t.Errorf("OAuthFlow() = %+v, want nil when session is set (no second Connect card)", flow)
+	}
+	if got := reuse.OAuthSessionSource(); got != "aws-sso" {
+		t.Errorf("OAuthSessionSource() = %q, want %q", got, "aws-sso")
+	}
+
+	own := &AWSSSOEKSCredential{StartURL: "https://my-org.awsapps.com/start", Region: "eu-central-1"}
+	if flow := own.OAuthFlow(); flow == nil {
+		t.Error("OAuthFlow() = nil, want its own aws_sso flow when session is unset")
+	}
+	if got := own.OAuthSessionSource(); got != "" {
+		t.Errorf("OAuthSessionSource() = %q, want empty when session is unset", got)
+	}
+}
+
+// TestValidateAWSSSOEKSCredential covers the load-time login-shape rules:
+// region is always required, and exactly one of start_url (own login) or
+// session (reuse) must be set.
+func TestValidateAWSSSOEKSCredential(t *testing.T) {
+	ctx := &config.BuildCtx{Block: &hcl.Block{}}
+	cases := []struct {
+		name    string
+		cred    *AWSSSOEKSCredential
+		wantErr string // substring the diagnostics must mention; "" = valid
+	}{
+		{"own login", &AWSSSOEKSCredential{StartURL: "https://org.awsapps.com/start", Region: "eu-central-1"}, ""},
+		{"session reuse", &AWSSSOEKSCredential{Session: "aws-sso", Region: "eu-central-1"}, ""},
+		{"missing region", &AWSSSOEKSCredential{StartURL: "https://org.awsapps.com/start"}, "region"},
+		{"neither start_url nor session", &AWSSSOEKSCredential{Region: "eu-central-1"}, "start_url"},
+		{"both start_url and session", &AWSSSOEKSCredential{StartURL: "https://org.awsapps.com/start", Session: "aws-sso", Region: "eu-central-1"}, "not both"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			diags := validateAWSSSOEKSCredential(tc.cred, tc.name, ctx)
+			if tc.wantErr == "" {
+				if diags.HasErrors() {
+					t.Fatalf("diags = %v, want none", diags)
+				}
+				return
+			}
+			if !diags.HasErrors() {
+				t.Fatalf("diags = none, want one mentioning %q", tc.wantErr)
+			}
+			if !strings.Contains(diags.Error(), tc.wantErr) {
+				t.Errorf("diags = %q, want one mentioning %q", diags.Error(), tc.wantErr)
+			}
+		})
 	}
 }
 

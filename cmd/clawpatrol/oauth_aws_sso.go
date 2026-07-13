@@ -30,7 +30,42 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssooidc"
 	ssooidctypes "github.com/aws/aws-sdk-go-v2/service/ssooidc/types"
 	"golang.org/x/oauth2"
+
+	"github.com/denoland/clawpatrol/internal/config"
 )
+
+// oauthSessionReferencer is implemented by a credential whose OAuth
+// session is owned by a *different* credential: instead of running its
+// own device login it reuses the owner's persisted token. The only
+// implementer today is aws_sso_eks_credential (`session = "<owner>"`),
+// so an operator who runs both the plain AWS SSO credential and the EKS
+// one logs into AWS SSO once, not twice.
+type oauthSessionReferencer interface {
+	// OAuthSessionSource returns the bare name of the credential that
+	// owns the SSO session to reuse, or "" to run an own login.
+	OAuthSessionSource() string
+}
+
+// registerSSOSessionAliases wires every session-referencing credential's
+// id to the credential that owns its OAuth session, so the secret store
+// resolves the borrowed token through OAuthRegistry.Token's alias path.
+// Called from registerOAuthCredentials on boot and every policy reload.
+// Idempotent and additive, mirroring registerOAuthCredentials: a renamed
+// owner leaves a stale alias that harmlessly resolves to no token.
+func registerSSOSessionAliases(reg *OAuthRegistry, policy *config.CompiledPolicy) {
+	if reg == nil || policy == nil {
+		return
+	}
+	for name, ent := range policy.Credentials {
+		ref, ok := ent.Body.(oauthSessionReferencer)
+		if !ok {
+			continue
+		}
+		if src := ref.OAuthSessionSource(); src != "" {
+			reg.SetAlias(name, src)
+		}
+	}
+}
 
 // isRetryableCreateTokenErr reports whether a CreateToken failure is transient
 // rather than terminal: the oauthUpstreamTimeout deadline / a cancel, a network

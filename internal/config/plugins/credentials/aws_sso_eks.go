@@ -36,6 +36,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
 
@@ -57,13 +58,28 @@ const ssoMintTimeout = 15 * time.Second
 // start URL is the SSO access-portal URL, and Region is the SSO portal
 // region. There is no secret slot — the SSO access token is delivered as
 // the runtime Secret by the core OAuth device flow.
+//
+// Session is the session-reuse alternative to StartURL: set it (instead
+// of start_url) to the bare name of another AWS SSO credential and this
+// credential borrows that credential's SSO login rather than prompting a
+// second AWS SSO device login. The host resolves the borrowed token via
+// OAuthSessionSource + the OAuthRegistry alias path; Region is still
+// required either way (it scopes sso:GetRoleCredentials).
 type AWSSSOEKSCredential struct {
 	// StartURL is the AWS SSO access-portal start URL, e.g.
-	// https://my-org.awsapps.com/start.
-	StartURL string `hcl:"start_url"`
+	// https://my-org.awsapps.com/start. Empty when Session is set (this
+	// credential then reuses another credential's login and needs no
+	// start URL of its own).
+	StartURL string `hcl:"start_url,optional"`
 	// Region is the SSO portal region — where GetRoleCredentials is
 	// called. Independent of the cluster/STS region on the endpoint.
 	Region string `hcl:"region"`
+	// Session, when set, is the bare name of the AWS SSO credential whose
+	// device login this credential reuses. Mutually exclusive with
+	// StartURL: with Session set this credential runs no OAuth flow of its
+	// own (OAuthFlow returns nil, so the dashboard shows no Connect card)
+	// and its SSO access token resolves to the named credential's session.
+	Session string `hcl:"session,optional"`
 
 	// newClient is the sso-client seam; nil in production (direct
 	// in-process client), set by tests to point at a mock server.
@@ -172,12 +188,27 @@ func (c *AWSSSOEKSCredential) minterFor(token string) *ssoMinter {
 	return c.minter
 }
 
+// OAuthSessionSource is the session-reuse seam (see the
+// oauthSessionReferencer contract in cmd/clawpatrol/oauth_aws_sso.go):
+// when non-empty it names the credential that owns the AWS SSO login
+// this credential reuses, so the host resolves this credential's token
+// to that credential's session instead of demanding a second AWS SSO
+// device login. Empty means this credential runs its own login.
+func (c *AWSSSOEKSCredential) OAuthSessionSource() string { return c.Session }
+
 // OAuthFlow declares the aws_sso device flow so the dashboard Connect
 // card drives the existing core SSO login and the persisted SSO access
 // token is delivered as this credential's runtime Secret. AuthURL is the
 // SSO start URL the operator verifies; DeviceURL carries the SSO region
 // (the shape startAWSSSODeviceFlow reads).
+//
+// Returns nil when Session is set: this credential then reuses the named
+// credential's SSO login, so it registers no OAuth integration and the
+// dashboard renders no (redundant) Connect card for it.
 func (c *AWSSSOEKSCredential) OAuthFlow() *config.OAuthIntegration {
+	if c.Session != "" {
+		return nil
+	}
 	return &config.OAuthIntegration{
 		Flow: "aws_sso",
 		OAuth: config.OAuthConfig{
@@ -187,19 +218,67 @@ func (c *AWSSSOEKSCredential) OAuthFlow() *config.OAuthIntegration {
 	}
 }
 
+// validateAWSSSOEKSCredential enforces the login shape at load time so a
+// misconfiguration surfaces as a visible policy error rather than a
+// request-time sign failure that forwards uninjected: region (the SSO
+// portal region for sso:GetRoleCredentials) is always required, and
+// exactly one of start_url (own device login) or session (reuse another
+// credential's login) must be set.
+func validateAWSSSOEKSCredential(d any, name string, ctx *config.BuildCtx) hcl.Diagnostics {
+	c, ok := d.(*AWSSSOEKSCredential)
+	if !ok {
+		return nil
+	}
+	defRange := ctx.Block.DefRange
+	var diags hcl.Diagnostics
+	if c.Region == "" {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("Missing region on credential %q", name),
+			Detail:   "region is the AWS SSO portal region (where sso:GetRoleCredentials is called) and is always required.",
+			Subject:  &defRange,
+		})
+	}
+	switch {
+	case c.StartURL == "" && c.Session == "":
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("Missing start_url on credential %q", name),
+			Detail:   `set start_url to run this credential's own AWS SSO device login, or set session = "<credential>" to reuse another credential's SSO login.`,
+			Subject:  &defRange,
+		})
+	case c.StartURL != "" && c.Session != "":
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("Conflicting login config on credential %q", name),
+			Detail:   "set either start_url (own AWS SSO device login) or session (reuse another credential's login), not both.",
+			Subject:  &defRange,
+		})
+	}
+	return diags
+}
+
 func init() {
 	var _ runtime.HTTPRequestSigner = (*AWSSSOEKSCredential)(nil)
 	var _ config.OAuthFlowProvider = (*AWSSSOEKSCredential)(nil)
 	config.Register(&config.Plugin{
-		Kind:    config.KindCredential,
-		Type:    "aws_sso_eks_credential",
-		New:     newer[AWSSSOEKSCredential](),
-		Runtime: (*AWSSSOEKSCredential)(nil),
-		Build:   passthrough,
+		Kind:     config.KindCredential,
+		Type:     "aws_sso_eks_credential",
+		New:      newer[AWSSSOEKSCredential](),
+		Runtime:  (*AWSSSOEKSCredential)(nil),
+		Validate: validateAWSSSOEKSCredential,
+		Build:    passthrough,
 		Emit: func(body any, _ string, b *hclwrite.Body) {
 			e := body.(*AWSSSOEKSCredential)
-			b.SetAttributeValue("start_url", cty.StringVal(e.StartURL))
+			// start_url and session are mutually exclusive; emit only the
+			// one that's set so a round-trip doesn't resurrect the other.
+			if e.StartURL != "" {
+				b.SetAttributeValue("start_url", cty.StringVal(e.StartURL))
+			}
 			b.SetAttributeValue("region", cty.StringVal(e.Region))
+			if e.Session != "" {
+				b.SetAttributeValue("session", cty.StringVal(e.Session))
+			}
 		},
 	})
 }
